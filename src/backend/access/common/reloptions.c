@@ -24,6 +24,7 @@
 #include "access/nbtree.h"
 #include "access/reloptions.h"
 #include "access/spgist_private.h"
+#include "access/stree_private.h"
 #include "catalog/pg_type.h"
 #include "commands/defrem.h"
 #include "commands/tablespace.h"
