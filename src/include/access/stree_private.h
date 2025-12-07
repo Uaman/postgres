@@ -11,6 +11,9 @@
 #include "access/amapi.h"
 #include "mb/pg_wchar.h"
 
+/* Tunning points */
+#define STREE_BSEARCH_THRESHOLD 16
+
 /* Suffix Tree state information */
 typedef struct STreeState
 {
@@ -39,7 +42,7 @@ typedef struct STreeBuildState {
 #define STREE_MAGIC_NUMBER (0xC0FFEE42) // Used to identify memory corruption detection
 
 //Index of the column that is going to be indexed
-#define STreeKeyColumn 0
+#define streeIndexedColumn 0
 
 /* Page numbers of fixed-location pages */
 #define STREE_METAPAGE_BLK	  (0)	/* metapage */
@@ -88,18 +91,18 @@ typedef struct STreeMetaPageData
 #define STreePageGetMetaStart(p) \
     ((STreeMetaPageData *) PageGetContents(p))
 
-typedef struct STreeRootNodeEntry
-{
-    BlockNumber childBlockNumber;
-    unsigned char  edgeLabel; // edge label (substring)
-} STreeRootNodeEntry;
+// typedef struct STreeRootNodeEntry
+// {
+//     BlockNumber childBlockNumber;
+//     pg_wchar  edgeLabel; // edge label (substring)
+// } STreeRootNodeEntry;
 
-typedef struct STreeRootNodeInnerData {
-    uint32      numberOfEntries;   /* number of entries in the root node */
-    STreeRootNodeEntry entries[FLEXIBLE_ARRAY_MEMBER]; /* array of root node entries */
-} STreeRootNodeInnerData;
+// typedef struct STreeRootNodeInnerData {
+//     uint32      numberOfEntries;   /* number of entries in the root node */
+//     STreeRootNodeEntry entries[FLEXIBLE_ARRAY_MEMBER]; /* array of root node entries */
+// } STreeRootNodeInnerData;
 
-typedef STreeRootNodeInnerData *STreeRootNodeInner;
+// typedef STreeRootNodeInnerData *STreeRootNodeInner;
 
 
 typedef struct STreeNodePageOpaqueData
@@ -116,45 +119,60 @@ typedef struct STreeNodePageOpaqueData
 
 typedef STreeNodePageOpaqueData *STreeNodePageOpaque;
 
+typedef struct STreeEdgeIdArrayHeader
+{
+    uint32      numberOfEdges;       /* number of edges on this page */
+    /* Followed by STreeEdgeIdData[numEdges] */
+} STreeEdgeIdArrayHeader;
+
+#define STreePageGetEdgeIdHeader(page) \
+    ((STreeEdgeIdArrayHeader *) PageGetContents(page))
+
+#define STreePageGetNumEdges(page) \
+    (STreePageGetEdgeIdHeader(page)->numberOfEdges)
+
+#define STreePageGetEdgeIds(page) \
+    ((STreeEdgeIdData *) (((char *) PageGetContents(page)) + sizeof(STreeEdgeIdArrayHeader)))
+
+/*
+ * Calculate size needed for edge ID array
+ */
+#define STreeEdgeIdArraySize(numEdges) \
+    (sizeof(STreeEdgeIdArrayHeader) + ((numEdges) * sizeof(STreeEdgeIdData)))
+
 typedef struct STreeEdgeIdData
 {
     //pg_wchar firstChar; // for utf8 support?
-    unsigned char firstChar; // first character of the edge label
-    unsigned short  edgeOffset: 16; // offset of the edge label in the page
-    unsigned short  edgeLength: 16; // length of the edge label
-    
-    // // pg_wchar    *edgeLabel; // something for utf8 support
+    pg_wchar firstChar; // first character of the edge label
+    uint16  realEdgeOffset: 16; // offset of the edge in the page
+    uint16  realEdgeDataLength: 16; // length of the edge data
 } STreeEdgeIdData;
 
 typedef STreeEdgeIdData *STreeEdgeId;
 
-#define SizeOfEdgeIdData (sizeof(STreeEdgeIdData))
+// #define EDGE_HIGH_CHAR      ((OffsetNumber) 1)
+// #define EDGE_FIRST_ID_DATA  ((OffsetNumber) 2)
 
 /*
  * Macros to access EdgeId fields
  */
-#define EdgeIdGetFirstChar(edgeId)  ((edgeId)->first_char)
-#define EdgeIdGetOffset(edgeId)     ((edgeId)->offset)
-#define EdgeIdGetLength(edgeId)     ((edgeId)->length)
-#define EdgeIdGetFlags(edgeId)      ((edgeId)->flags)
-#define EdgeIdIsNormal(edgeId)      ((edgeId)->flags == EDGE_NORMAL)
+#define EdgeIdGetFirstChar(edgeId)  ((edgeId)->firstChar)
+#define EdgeIdGetOffset(edgeId)     ((edgeId)->realEdgeOffset)
+#define EdgeIdGetStringByteLength(edgeId)     ((edgeId)->realEdgeDataLength)
 
 
-typedef struct EdgeInsideData
+typedef struct STreeEdgeInsideData
 {
     BlockNumber destinationNode;    /* 4 bytes - destination node number */
-    uint16 labelLength;            /* 2 bytes - length of label string */
-    //uint16 flags;               /* 2 bytes - edge attributes */
-    /*
-     * Followed immediately by:
-     * - label string (labelLength bytes) unsigned char*
-     */
-} EdgeInsideData;
+    uint16 labelLength;            /* BYTE count, not character count */
+    char label[FLEXIBLE_ARRAY_MEMBER];  /* raw UTF-8 bytes */
+} STreeEdgeInsideData;
 
-typedef EdgeInsideData *EdgeData;
+typedef STreeEdgeInsideData *STreeEdgeInside;
 
-#define EdgeDataGetDestination(edge)    ((edge)->destination_node)
-#define EdgeDataGetLabelLength(edge)    ((edge)->label_length)
+#define SizeOfSTreeEdgeInsideData  offsetof(STreeEdgeInsideData, label)
+
+
 
 typedef struct STreeNodeTupleDataEntries {
     unsigned int numberOfEntries: 32;   /* number of data items  */
@@ -168,7 +186,6 @@ typedef STreeNodeTupleDataEntries *STreeNodeTupleDataEntriesPtr;
                                          (sizeof(STreeNodeTupleData) * (numberOfEntries)))
 #define STREE_NODE_TUPLE_DATA_ENTRIES_PTR(x)		((x)->numberOfEntries > 0 ? ((char *) (x)) + STREE_NODE_TUPLE_DATA_ENTRIES_HEADER_SIZE : NULL)
 
-
 typedef IndexTupleData STreeNodeTupleData;
 
 typedef STreeNodeTupleData *STreeNodeTuple;
@@ -180,6 +197,159 @@ typedef STreeNodeTupleData *STreeNodeTuple;
                                          PointerGetDatum(STREE_NODE_DATA_PTR(x)))
 
 
+// Inline function declarations
+/*
+ * Helper: Get byte length of a pg_wchar when encoded in database encoding.
+ */
+static inline pg_wchar
+streeGetNextChar(const char **strptr, const char *strend)
+{
+    const char *s = *strptr;
+    int         mblen;
+    pg_wchar    result;
+
+    if (s >= strend)
+        return 0;  /* End of string */
+
+    /* Get byte length of this multibyte character */
+    mblen = pg_mblen(s);
+    
+    /* Safety check - don't go past end */
+    if (s + mblen > strend)
+        mblen = strend - s;
+
+    /* Convert multibyte char to wide character (Unicode codepoint) */
+    pg_mb2wchar_with_len((const unsigned char *) s, &result, mblen);
+
+    /* Advance pointer by the number of bytes consumed */
+    *strptr += mblen;
+
+    return result;
+}
+
+/*
+ * Helper: Get byte length of a pg_wchar when encoded in database encoding.
+ */
+static inline int
+streeWcharMblen(pg_wchar wc)
+{
+    unsigned char buf[MAX_MULTIBYTE_CHAR_LEN + 1];
+    
+    return pg_wchar2mb_with_len(&wc, (char *) buf, 1);
+}
+
+/*
+ * Helper: Get EdgeInsideData pointer from an edge ID.
+ */
+static inline STreeEdgeInsideData *
+streeGetEdgeData(Page page, STreeEdgeIdData *edgeId)
+{
+    return (STreeEdgeInsideData *) (((char *) page) + edgeId->realEdgeOffset);
+}
+
+/* Helper: Get the remaining label (after firstChar) */
+static inline char *
+STreeGetEdgeLabel(STreeEdgeInsideData *edge)
+{
+    return ((char *) edge) + SizeOfSTreeEdgeInsideData;
+}
+
+/* Get destination node */
+static inline BlockNumber
+streeGetEdgeDestination(Page page, STreeEdgeIdData *edgeId)
+{
+    STreeEdgeInsideData *edge = streeGetEdgeData(page, edgeId);
+    return edge->destinationNode;
+}
+
+/*
+ * 
+ * Helper: Get the length of an edge label in characters.
+ *
+ * Parameters:
+ *   edgeData - Pointer to the edge inside data
+ *
+ * Returns:
+ *   Number of characters in the label.
+ */
+static inline int
+getEdgeLabelCharLength(STreeEdgeInsideData *edgeData)
+{
+    if (edgeData == NULL || edgeData->labelLength == 0)
+        return 0;
+
+    return pg_mbstrlen_with_len(edgeData->label, edgeData->labelLength);
+}
+
+/* Helper to get character at position within edge label */
+static inline pg_wchar
+getEdgeLabelCharAt(STreeEdgeInsideData *edgeData, int charPos)
+{
+    const char *labelPtr;
+    const char *labelEnd;
+    int         i;
+    pg_wchar    result = 0;
+
+    if (edgeData == NULL || charPos < 0)
+        return 0;
+
+    labelPtr = edgeData->label;
+    labelEnd = edgeData->label + edgeData->labelLength;
+
+    for (i = 0; i < charPos && labelPtr < labelEnd; i++)
+    {
+        labelPtr += pg_mblen(labelPtr);
+    }
+
+    if (labelPtr >= labelEnd)
+        return 0;
+
+    pg_mb2wchar_with_len((const unsigned char *) labelPtr,
+                         &result,
+                         pg_mblen(labelPtr));
+
+    return result;
+}
+
+/*
+ * Helper: getByteOffsetForCharPos - Get byte pointer for a character position.
+ */
+static inline const char *
+getByteOffsetForCharPos(const char *strValue, const char *strEnd, int charPos)
+{
+    const char *ptr = strValue;
+    int         i;
+
+    for (i = 0; i < charPos && ptr < strEnd; i++)
+    {
+        ptr += pg_mblen(ptr);
+    }
+
+    return ptr;
+}
+
+/*
+ * Helper: getCharAtPosition - Get the Unicode codepoint at a character position.
+ */
+static inline pg_wchar
+getCharAtPosition(const char *strValue, const char *strEnd, int charPos)
+{
+    const char *ptr = strValue;
+    int         i;
+    pg_wchar    result = 0;
+
+    for (i = 0; i < charPos && ptr < strEnd; i++)
+    {
+        ptr += pg_mblen(ptr);
+    }
+
+    if (ptr >= strEnd)
+        return 0;
+
+    pg_mb2wchar_with_len((const unsigned char *) ptr, &result, pg_mblen(ptr));
+    return result;
+}
+
 // extern bool streedoinsert(Relation index, SpGistState *state,
 // 						ItemPointer heapPtr, Datum *datums, bool *isnulls);
 extern void STreeInitPage(Page page, uint16 f);
@@ -188,4 +358,27 @@ extern Buffer STreeGetNewBuffer(Relation index);
 extern void initSTreeState(STreeState *state, Relation index);
 extern bool streeinserttuple(Relation index, STreeBuildState *state,
                  ItemPointer tid, Datum *values, bool *isnull);
+
+/* Edge operations */
+extern STreeEdgeIdData *lookupEdgeByFirstChar(Page page, pg_wchar firstChar);
+extern STreeEdgeIdData *insertEdgeSorted(Page page, pg_wchar firstChar, 
+                                         const char *labelData, uint16 labelLen,
+                                         BlockNumber destBlock);
+extern BlockNumber splitEdgeWithBuffer(Relation index, Buffer parentBuffer, 
+                                       STreeEdgeIdData *edgeId, int splitCharPos,
+                                       BlockNumber *newNodeBlknoOut);
+extern bool walkDown(Relation index, STreeActiveNode *activeNode, int *activeEdgeCharIdx,
+              int *activeLength, const char *strValue, const char *strEnd, Buffer rootBuffer);
+
+/* Data page operations for storing heap TIDs */
+extern bool streeAddHeapTid(Relation index, Buffer leafBuffer, 
+                            STreeEdgeIdData *edgeId, ItemPointer tid);
+extern Buffer streeAllocateDataPage(Relation index, Buffer leafBuffer, 
+                                    STreeEdgeIdData *edgeId);
+extern Buffer streeAllocateOverflowDataPage(Relation index, Buffer leafBuffer,
+                                            STreeEdgeIdData *edgeId, 
+                                            BlockNumber currentBlkno);
+extern int streeGetDataPageTids(Relation index, BlockNumber dataBlkno,
+                                void (*callback)(ItemPointer tid, void *arg), 
+                                void *callbackArg);
 #endif   /* STREE_PRIVATE_H */

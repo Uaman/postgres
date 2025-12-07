@@ -20,7 +20,7 @@ static void streeBuildCallback(Relation index, ItemPointer tid, Datum *values,
     oldCtx = MemoryContextSwitchTo(buildState->tmpMemCtx);
 
     /*
-     * Need to be ready to concurent insertion and getting a buffer-locking failure. 
+     * Need to be ready to concurrent insertion and getting a buffer-locking failure. 
      * Should be ready to retry.  We can flush
      * any temp data when retrying.
      */

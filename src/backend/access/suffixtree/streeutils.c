@@ -139,3 +139,167 @@ void initSTreeState(STreeState *state, Relation index) {
     state->redirectXid = GetTopTransactionIdIfAny();
 }
 
+/*
+ * streeAllocateDataPage - Allocate a new data page for storing heap TIDs.
+ *
+ * This is called when a leaf edge has no data page yet.
+ *
+ * Parameters:
+ *   index      - The relation
+ *   leafBuffer - Buffer of the leaf node page (must be locked)
+ *   edgeId     - The edge ID to update with the new data page
+ *
+ * Returns:
+ *   Buffer of the new data page (locked), or InvalidBuffer on failure
+ */
+Buffer
+streeAllocateDataPage(Relation index, Buffer leafBuffer, STreeEdgeIdData *edgeId)
+{
+    Buffer                  dataBuffer;
+    Page                    dataPage;
+    Page                    leafPage;
+    STreeEdgeInsideData    *edgeData;
+    STreeNodePageOpaque     opaque;
+    STreeNodeTupleDataEntries *header;
+    BlockNumber             dataBlkno;
+
+    /* Allocate new page */
+    dataBuffer = STreeGetNewBuffer(index);
+    if (!BufferIsValid(dataBuffer))
+        return InvalidBuffer;
+
+    dataBlkno = BufferGetBlockNumber(dataBuffer);
+    LockBuffer(dataBuffer, BUFFER_LOCK_EXCLUSIVE);
+    dataPage = BufferGetPage(dataBuffer);
+    leafPage = BufferGetPage(leafBuffer);
+
+    START_CRIT_SECTION();
+
+    /* Initialize the data page */
+    STreeInitPage(dataPage, STREE_DATA_NODE_PAGE);
+
+    /* Set up opaque data */
+    opaque = (STreeNodePageOpaque) PageGetSpecialPointer(dataPage);
+    opaque->parentNode = BufferGetBlockNumber(leafBuffer);
+    opaque->prevSiblingNode = InvalidBlockNumber;
+    opaque->nextSiblingNode = InvalidBlockNumber;
+    opaque->itemPointersStart = InvalidBlockNumber;
+    opaque->firstNode = InvalidBlockNumber;
+    opaque->suffixLink = InvalidBlockNumber;
+    opaque->streePageId = STREE_PAGE_ID;
+    opaque->flags = STREE_DATA_NODE_PAGE;
+
+    /* Initialize the tuple entries header */
+    header = (STreeNodeTupleDataEntries *) PageGetContents(dataPage);
+    header->numberOfEntries = 0;
+
+    /* Update the leaf edge to point to this data page */
+    edgeData = streeGetEdgeData(leafPage, edgeId);
+    edgeData->destinationNode = dataBlkno;
+
+    MarkBufferDirty(dataBuffer);
+    MarkBufferDirty(leafBuffer);
+
+    END_CRIT_SECTION();
+
+    return dataBuffer;
+}
+
+/*
+ * streeAllocateOverflowDataPage - Allocate an overflow data page when current is full.
+ *
+ * Creates a chain of data pages for leaves with many TIDs.
+ *
+ * Parameters:
+ *   index         - The relation
+ *   leafBuffer    - Buffer of the leaf node page
+ *   edgeId        - The edge ID
+ *   currentBlkno  - Block number of the current (full) data page
+ *
+ * Returns:
+ *   Buffer of the new overflow page (locked), or InvalidBuffer on failure
+ */
+Buffer
+streeAllocateOverflowDataPage(Relation index, Buffer leafBuffer, 
+                               STreeEdgeIdData *edgeId, BlockNumber currentBlkno)
+{
+    Buffer                  currentBuffer;
+    Buffer                  newBuffer;
+    Page                    currentPage;
+    Page                    newPage;
+    STreeNodePageOpaque     currentOpaque;
+    STreeNodePageOpaque     newOpaque;
+    STreeNodeTupleDataEntries *header;
+    BlockNumber             newBlkno;
+
+    /* Read current data page to update its next sibling link */
+    currentBuffer = ReadBuffer(index, currentBlkno);
+    LockBuffer(currentBuffer, BUFFER_LOCK_EXCLUSIVE);
+    currentPage = BufferGetPage(currentBuffer);
+
+    /* Allocate new overflow page */
+    newBuffer = STreeGetNewBuffer(index);
+    if (!BufferIsValid(newBuffer))
+    {
+        UnlockReleaseBuffer(currentBuffer);
+        return InvalidBuffer;
+    }
+
+    newBlkno = BufferGetBlockNumber(newBuffer);
+    LockBuffer(newBuffer, BUFFER_LOCK_EXCLUSIVE);
+    newPage = BufferGetPage(newBuffer);
+
+    START_CRIT_SECTION();
+
+    /* Initialize the new overflow page */
+    STreeInitPage(newPage, STREE_DATA_NODE_PAGE);
+
+    /* Set up opaque data for new page */
+    newOpaque = (STreeNodePageOpaque) PageGetSpecialPointer(newPage);
+    newOpaque->parentNode = BufferGetBlockNumber(leafBuffer);
+    newOpaque->prevSiblingNode = currentBlkno;
+    newOpaque->nextSiblingNode = InvalidBlockNumber;
+    newOpaque->itemPointersStart = InvalidBlockNumber;
+    newOpaque->firstNode = InvalidBlockNumber;
+    newOpaque->suffixLink = InvalidBlockNumber;
+    newOpaque->streePageId = STREE_PAGE_ID;
+    newOpaque->flags = STREE_DATA_NODE_PAGE;
+
+    /* Initialize tuple entries header */
+    header = (STreeNodeTupleDataEntries *) PageGetContents(newPage);
+    header->numberOfEntries = 0;
+
+    /* Update current page to point to new page */
+    currentOpaque = (STreeNodePageOpaque) PageGetSpecialPointer(currentPage);
+    currentOpaque->nextSiblingNode = newBlkno;
+
+    MarkBufferDirty(newBuffer);
+    MarkBufferDirty(currentBuffer);
+
+    END_CRIT_SECTION();
+
+    UnlockReleaseBuffer(currentBuffer);
+
+    return newBuffer;
+}
+
+
+/*
+ * PageGetFreeSpaceEnd - Get the offset where free space ends (before edge data).
+ *
+ * This assumes edge data grows downward from the special pointer area.
+ * You may need to track this in your page header or calculate it.
+ */
+// static Offset
+// PageGetFreeSpaceEnd(Page page)
+// {
+//     STreeNodePageOpaque opaque;
+    
+//     opaque = (STreeNodePageOpaque) PageGetSpecialPointer(page);
+    
+//     /* 
+//      * If you track the lowest edge data offset in opaque or header,
+//      * return that. Otherwise, calculate based on existing edges.
+//      */
+//     return opaque->lowestEdgeDataOffset;
+// }
