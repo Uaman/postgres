@@ -33,5 +33,8 @@
 { oid => '3580', oid_symbol => 'BRIN_AM_OID',
   descr => 'block range index (BRIN) access method',
   amname => 'brin', amhandler => 'brinhandler', amtype => 'i' },
+{ oid => '8901', oid_symbol => 'STREE_AM_OID',
+  descr => 'suffix tree index access method',
+  amname => 'stree', amhandler => 'streehandler', amtype => 'i' },
 
 ]

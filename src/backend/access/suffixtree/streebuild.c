@@ -3,11 +3,14 @@
 
 #include "access/amapi.h"// API for Postgres index access methods.
 #include "access/stree_private.h"// private declarations for Suffix Tree access method
+#include "access/tableam.h"// for table_index_build_scan
+#include "access/xloginsert.h"// for log_newpage_range
 #include "nodes/execnodes.h"// definitions for executor state nodes
 #include "miscadmin.h"// general postgres administration and initialization stuff
 #include "storage/bufmgr.h"
 #include "storage/bulk_write.h"
 #include "utils/memutils.h"
+#include "utils/rel.h"
 
 
 static void streeBuildCallback(Relation index, ItemPointer tid, Datum *values,
@@ -15,6 +18,9 @@ static void streeBuildCallback(Relation index, ItemPointer tid, Datum *values,
 {
     STreeBuildState *buildState = (STreeBuildState *) state;
     MemoryContext oldCtx;
+
+    elog(LOG, "streeBuildCallback: entering for tuple %u/%u", 
+         ItemPointerGetBlockNumber(tid), ItemPointerGetOffsetNumber(tid));
 
     /* Build in temporary memory context, and reset it after each tuple insert */
     oldCtx = MemoryContextSwitchTo(buildState->tmpMemCtx);
@@ -24,7 +30,7 @@ static void streeBuildCallback(Relation index, ItemPointer tid, Datum *values,
      * Should be ready to retry.  We can flush
      * any temp data when retrying.
      */
-    while (!streeinserttuple(index, &buildState->indexState, tid,
+    while (!streeinserttuple(index, buildState, tid,
                         values, isnull))
     {
         MemoryContextReset(buildState->tmpMemCtx);
@@ -35,6 +41,9 @@ static void streeBuildCallback(Relation index, ItemPointer tid, Datum *values,
 
     MemoryContextSwitchTo(oldCtx);
     MemoryContextReset(buildState->tmpMemCtx);
+
+    elog(LOG, "streeBuildCallback: completed for tuple %u/%u", 
+         ItemPointerGetBlockNumber(tid), ItemPointerGetOffsetNumber(tid));
 }
 
 /*
@@ -138,4 +147,46 @@ streebuildempty(Relation index)
 
 
 	smgr_bulk_finish(writestate);
+}
+
+/*
+ * Insert a single tuple into an existing suffix tree index.
+ * This is called for each tuple during INSERT operations.
+ */
+bool
+streeinsert(Relation index, Datum *values, bool *isnull,
+            ItemPointer ht_ctid, Relation heapRel,
+            IndexUniqueCheck checkUnique,
+            bool indexUnchanged, IndexInfo *indexInfo)
+{
+    STreeBuildState buildState;
+    MemoryContext oldCtx;
+    MemoryContext tmpCtx;
+
+    /* Create temporary memory context for this insert */
+    tmpCtx = AllocSetContextCreate(CurrentMemoryContext,
+                                   "STree insert temporary context",
+                                   ALLOCSET_DEFAULT_SIZES);
+    oldCtx = MemoryContextSwitchTo(tmpCtx);
+
+    /* Initialize state for insertion */
+    initSTreeState(&buildState.indexState, index);
+    buildState.indexState.isBuild = false;
+    buildState.indexedTuples = 0;
+    buildState.tmpMemCtx = tmpCtx;
+
+    /*
+     * Try to insert the tuple, retrying if we get a buffer-locking failure.
+     */
+    while (!streeinserttuple(index, &buildState, ht_ctid,
+                             values, isnull))
+    {
+        MemoryContextReset(tmpCtx);
+    }
+
+    MemoryContextSwitchTo(oldCtx);
+    MemoryContextDelete(tmpCtx);
+
+    /* Suffix tree index is never unique */
+    return false;
 }

@@ -115,6 +115,7 @@ splitEdge(Relation index, Page parentPage, STreeEdgeIdData *edgeId, int splitCha
 
     /*
      * Allocate a new page for the internal node.
+     * STreeGetNewBuffer returns a locked buffer.
      */
     newNodeBuffer = STreeGetNewBuffer(index);
     if (!BufferIsValid(newNodeBuffer))
@@ -124,7 +125,7 @@ splitEdge(Relation index, Page parentPage, STreeEdgeIdData *edgeId, int splitCha
     }
 
     newNodeBlkno = BufferGetBlockNumber(newNodeBuffer);
-    LockBuffer(newNodeBuffer, BUFFER_LOCK_EXCLUSIVE);
+    /* Buffer is already exclusively locked by STreeGetNewBuffer */
     newNodePage = BufferGetPage(newNodeBuffer);
 
     START_CRIT_SECTION();
@@ -190,7 +191,7 @@ splitEdge(Relation index, Page parentPage, STreeEdgeIdData *edgeId, int splitCha
     }
 
     MarkBufferDirty(newNodeBuffer);
-    MarkBufferDirty(BufferGetBuffer(parentPage));  /* Need buffer, not page */
+    /* Parent buffer is marked dirty by caller (splitEdgeWithBuffer) */
 
     END_CRIT_SECTION();
 
@@ -261,6 +262,7 @@ splitEdgeWithBuffer(Relation index, Buffer parentBuffer,
 
     /*
      * Allocate a new page for the internal node.
+     * STreeGetNewBuffer returns a locked buffer.
      */
     newNodeBuffer = STreeGetNewBuffer(index);
     if (!BufferIsValid(newNodeBuffer))
@@ -270,7 +272,7 @@ splitEdgeWithBuffer(Relation index, Buffer parentBuffer,
     }
 
     newNodeBlkno = BufferGetBlockNumber(newNodeBuffer);
-    LockBuffer(newNodeBuffer, BUFFER_LOCK_EXCLUSIVE);
+    /* Buffer is already exclusively locked by STreeGetNewBuffer */
     newNodePage = BufferGetPage(newNodeBuffer);
 
     START_CRIT_SECTION();

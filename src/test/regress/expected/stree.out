@@ -1,0 +1,162 @@
+--
+-- Test suffix tree index
+--
+-- Create a test table
+CREATE TABLE stree_test (
+    id serial PRIMARY KEY,
+    content text
+);
+-- Insert test data
+INSERT INTO stree_test (content) VALUES
+    ('hello world'),
+    ('hello there'),
+    ('world peace'),
+    ('peaceful world'),
+    ('the quick brown fox'),
+    ('fox jumps over the lazy dog'),
+    ('suffix tree test'),
+    ('testing suffix trees'),
+    ('substring search'),
+    ('search for substrings');
+-- Create suffix tree index
+CREATE INDEX stree_test_idx ON stree_test USING stree (content);
+-- Verify index exists
+SELECT indexname, indexdef FROM pg_indexes WHERE tablename = 'stree_test';
+    indexname     |                              indexdef                               
+------------------+---------------------------------------------------------------------
+ stree_test_pkey  | CREATE UNIQUE INDEX stree_test_pkey ON stree_test USING btree (id)
+ stree_test_idx   | CREATE INDEX stree_test_idx ON stree_test USING stree (content)
+(2 rows)
+
+-- Test substring search with LIKE
+SET enable_seqscan = OFF;
+SET enable_indexscan = ON;
+-- Search for 'world' - should find rows 1, 3, 4
+EXPLAIN (COSTS OFF) SELECT * FROM stree_test WHERE content LIKE '%world%';
+              QUERY PLAN               
+---------------------------------------
+ Index Scan using stree_test_idx on stree_test
+   Index Cond: (content ~~ '%world%'::text)
+(2 rows)
+
+SELECT * FROM stree_test WHERE content LIKE '%world%' ORDER BY id;
+ id |    content     
+----+----------------
+  1 | hello world
+  3 | world peace
+  4 | peaceful world
+(3 rows)
+
+-- Search for 'hello' - should find rows 1, 2
+EXPLAIN (COSTS OFF) SELECT * FROM stree_test WHERE content LIKE '%hello%';
+              QUERY PLAN               
+---------------------------------------
+ Index Scan using stree_test_idx on stree_test
+   Index Cond: (content ~~ '%hello%'::text)
+(2 rows)
+
+SELECT * FROM stree_test WHERE content LIKE '%hello%' ORDER BY id;
+ id |   content   
+----+-------------
+  1 | hello world
+  2 | hello there
+(2 rows)
+
+-- Search for 'fox' - should find rows 5, 6
+EXPLAIN (COSTS OFF) SELECT * FROM stree_test WHERE content LIKE '%fox%';
+              QUERY PLAN               
+---------------------------------------
+ Index Scan using stree_test_idx on stree_test
+   Index Cond: (content ~~ '%fox%'::text)
+(2 rows)
+
+SELECT * FROM stree_test WHERE content LIKE '%fox%' ORDER BY id;
+ id |           content            
+----+------------------------------
+  5 | the quick brown fox
+  6 | fox jumps over the lazy dog
+(2 rows)
+
+-- Search for 'suffix' - should find rows 7, 8
+EXPLAIN (COSTS OFF) SELECT * FROM stree_test WHERE content LIKE '%suffix%';
+              QUERY PLAN               
+---------------------------------------
+ Index Scan using stree_test_idx on stree_test
+   Index Cond: (content ~~ '%suffix%'::text)
+(2 rows)
+
+SELECT * FROM stree_test WHERE content LIKE '%suffix%' ORDER BY id;
+ id |       content        
+----+----------------------
+  7 | suffix tree test
+  8 | testing suffix trees
+(2 rows)
+
+-- Search for 'substring' - should find rows 9, 10
+EXPLAIN (COSTS OFF) SELECT * FROM stree_test WHERE content LIKE '%substring%';
+              QUERY PLAN               
+---------------------------------------
+ Index Scan using stree_test_idx on stree_test
+   Index Cond: (content ~~ '%substring%'::text)
+(2 rows)
+
+SELECT * FROM stree_test WHERE content LIKE '%substring%' ORDER BY id;
+ id |        content        
+----+-----------------------
+  9 | substring search
+ 10 | search for substrings
+(2 rows)
+
+-- Search for non-existent pattern
+EXPLAIN (COSTS OFF) SELECT * FROM stree_test WHERE content LIKE '%zzzzz%';
+              QUERY PLAN               
+---------------------------------------
+ Index Scan using stree_test_idx on stree_test
+   Index Cond: (content ~~ '%zzzzz%'::text)
+(2 rows)
+
+SELECT * FROM stree_test WHERE content LIKE '%zzzzz%' ORDER BY id;
+ id | content 
+----+---------
+(0 rows)
+
+-- Reset settings
+RESET enable_seqscan;
+RESET enable_indexscan;
+-- Test with UTF-8 characters
+CREATE TABLE stree_utf8_test (
+    id serial PRIMARY KEY,
+    content text
+);
+INSERT INTO stree_utf8_test (content) VALUES
+    ('привіт світ'),
+    ('привіт друг'),
+    ('світовий мир'),
+    ('こんにちは世界'),
+    ('世界平和'),
+    ('你好世界');
+CREATE INDEX stree_utf8_idx ON stree_utf8_test USING stree (content);
+SET enable_seqscan = OFF;
+SET enable_indexscan = ON;
+-- Search for Ukrainian 'світ' (world)
+SELECT * FROM stree_utf8_test WHERE content LIKE '%світ%' ORDER BY id;
+ id |    content    
+----+---------------
+  1 | привіт світ
+  3 | світовий мир
+(2 rows)
+
+-- Search for Japanese '世界' (world)
+SELECT * FROM stree_utf8_test WHERE content LIKE '%世界%' ORDER BY id;
+ id |    content     
+----+----------------
+  4 | こんにちは世界
+  5 | 世界平和
+  6 | 你好世界
+(3 rows)
+
+RESET enable_seqscan;
+RESET enable_indexscan;
+-- Cleanup
+DROP TABLE stree_test;
+DROP TABLE stree_utf8_test;

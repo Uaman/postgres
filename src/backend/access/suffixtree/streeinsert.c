@@ -32,9 +32,48 @@
 #include "mb/pg_wchar.h"  
 
 
+/*
+ * findEdgeInsertPosition - Find position to insert edge maintaining sorted order.
+ */
+static uint16
+findEdgeInsertPosition(STreeEdgeIdData *edgeIds, uint16 numOfEdges, pg_wchar firstChar)
+{
+    if (numOfEdges == 0)
+        return 0;
+
+    if (numOfEdges <= STREE_BSEARCH_THRESHOLD)
+    {
+        /* Linear search for small sets */
+        for (uint16 i = 0; i < numOfEdges; i++)
+        {
+            if (EdgeIdGetFirstChar(&edgeIds[i]) >= firstChar)
+                return i;
+        }
+        return numOfEdges;
+    }
+    else
+    {
+        /* Binary search for larger sets */
+        uint16 low = 0;
+        uint16 high = numOfEdges;
+
+        while (low < high)
+        {
+            uint16 mid = low + (high - low) / 2;
+
+            if (EdgeIdGetFirstChar(&edgeIds[mid]) < firstChar)
+                low = mid + 1;
+            else
+                high = mid;
+        }
+        return low;
+    }
+}
 
 /**
- * 
+ * streeinserttuple - Insert one tuple into the suffix tree index.
+ *
+ * Uses Ukkonen's algorithm. Stores TID at EVERY node visited, not just leaves.
  */
 bool streeinserttuple(Relation index, STreeBuildState *state,
                  ItemPointer tid, Datum *values, bool *isnull) 
@@ -42,8 +81,8 @@ bool streeinserttuple(Relation index, STreeBuildState *state,
     bool        result = true;
     Datum       valueToInsert;
     char       *strValue;
-    int         strByteLength;      /* Length in bytes */
-    int         strCharLength;      /* Length in characters */
+    int         strByteLength;
+    int         strCharLength;
     const char *strEnd;
     const char *currentPos;
     int         charIndex;
@@ -55,27 +94,23 @@ bool streeinserttuple(Relation index, STreeBuildState *state,
     BlockNumber lastNewInternalNode = InvalidBlockNumber;
     Buffer      lastNewInternalBuffer = InvalidBuffer;
 
-
     /* Handle NULL values */
     if (isnull[streeIndexedColumn])
-    {
-        return true;  /* Skip nulls for now */
-    }
+        return true;
 
-    /* Detoast the value if needed (varlena type) */
+    /* Detoast the value if needed */
     valueToInsert = PointerGetDatum(PG_DETOAST_DATUM(values[streeIndexedColumn]));
     strValue = VARDATA_ANY(valueToInsert);
     strByteLength = VARSIZE_ANY_EXHDR(valueToInsert);
     strEnd = strValue + strByteLength;
 
-
-    /* Get character length (not byte length) for UTF-8 strings */
+    /* Get character length for UTF-8 strings */
     strCharLength = pg_mbstrlen_with_len(strValue, strByteLength);
 
     if (strCharLength <= 0)
-        return true;  /* Nothing to index */
+        return true;
 
-     /* Initialize active point */
+    /* Initialize active point */
     activeNode.blockNumber = STREE_ROOT_BLK;
     activeNode.buffer = InvalidBuffer;
     activeNode.page = NULL;
@@ -88,31 +123,41 @@ bool streeinserttuple(Relation index, STreeBuildState *state,
     activeNode.page = BufferGetPage(rootBuffer);
 
     /*
-     * Ukkonen's algorithm main loop.
-     * We iterate by CHARACTER (not byte), using pg_wchar for comparisons.
+     * Add TID to ROOT node - every string passes through root.
+     * This enables queries like '%' to find all strings.
      */
+    if (!streeAddHeapTidToNode(index, rootBuffer, tid))
+    {
+        elog(WARNING, "Failed to add heap TID to root node");
+        result = false;
+        goto cleanup;
+    }
+
+    /* Ukkonen's algorithm main loop */
     currentPos = strValue;
     charIndex = 0;
 
-    elog(DEBUG1, ">>>>>Starting insertion of string of byte length %d, char length %d",
+    elog(LOG, ">>>>>Starting insertion of string of byte length %d, char length %d",
          strByteLength, strCharLength);
+
     while (currentPos < strEnd)
     {
-        /* Get current character as Unicode codepoint */
         const char *charStart = currentPos;
         pg_wchar    currentChar = streeGetNextChar(&currentPos, strEnd);
         int         currentCharByteLen = currentPos - charStart;
 
         elog(DEBUG1, "Processing character at byte index %ld, Unicode codepoint %u",
              charStart - strValue, currentChar);
-        elog(DEBUG1, "Current char %u", currentChar);
 
-        // >>>>>>>> TODO: need to save and restore active point from state
+        //TODO: consider storing current insertion state for resuming after interrupt     
         if (INTERRUPTS_PENDING_CONDITION())
         {
             result = false;
             break;
         }
+
+        remainder++; 
+        charIndex++;
 
         /* Reset last new internal node for this phase */
         lastNewInternalNode = InvalidBlockNumber;
@@ -125,15 +170,23 @@ bool streeinserttuple(Relation index, STreeBuildState *state,
         while (remainder > 0)
         {
             if (activeLength == 0)
-            {
                 activeEdgeCharIdx = charIndex - 1;
-            }
 
             /* Walk down as far as possible */
-            while (walkDown(index, &activeNode, &activeEdgeCharIdx, &activeLength,
+            while (activeLength > 0 &&
+                   walkDown(index, &activeNode, &activeEdgeCharIdx, &activeLength,
                             strValue, strEnd, rootBuffer))
             {
-                /* Keep walking */
+                /*
+                 * When we walk down to a child node, add TID to that node too.
+                 * This ensures every node on the path has the TID.
+                 */
+                if (!streeAddHeapTidToNode(index, activeNode.buffer, tid))
+                {
+                    elog(WARNING, "Failed to add heap TID during walk down");
+                    result = false;
+                    goto cleanup;
+                }
             }
 
             /* Get the active edge character */
@@ -141,6 +194,9 @@ bool streeinserttuple(Relation index, STreeBuildState *state,
 
             /* Look for edge starting with active edge character */
             STreeEdgeIdData *edgeId = lookupEdgeByFirstChar(activeNode.page, activeEdgeChar);
+
+            elog(LOG, "Checked for edge with char %u, found: %s", 
+                 activeEdgeChar, edgeId ? "yes" : "no");
 
             if (edgeId == NULL)
             {
@@ -150,7 +206,8 @@ bool streeinserttuple(Relation index, STreeBuildState *state,
                 const char *labelStart = getByteOffsetForCharPos(strValue, strEnd, activeEdgeCharIdx);
                 int         labelBytes = strEnd - labelStart;
 
-                elog(DEBUG2, "Rule 2 (no edge): creating leaf at char %d", activeEdgeCharIdx);
+                elog(LOG, "Rule 2 (no edge): creating leaf at char %d, labelBytes=%d", 
+                     activeEdgeCharIdx, labelBytes);
 
                 START_CRIT_SECTION();
 
@@ -159,29 +216,29 @@ bool streeinserttuple(Relation index, STreeBuildState *state,
                     activeEdgeChar,
                     labelStart,
                     labelBytes,
-                    InvalidBlockNumber  /* Leaf - no child node */
+                    InvalidBlockNumber  /* Leaf - no child node yet */
                 );
 
                 if (newEdge == NULL)
                 {
-                    /* Page full - need to handle overflow */
                     END_CRIT_SECTION();
                     elog(WARNING, "Page full when inserting edge");
                     result = false;
                     goto cleanup;
                 }
 
+                elog(LOG, "Rule 2: Edge inserted successfully");
+
                 MarkBufferDirty(activeNode.buffer);
 
                 END_CRIT_SECTION();
 
-                /* Store the heap TID in the leaf's data page */
-                if (!streeAddHeapTid(index, activeNode.buffer, newEdge, tid))
-                {
-                    elog(WARNING, "Failed to add heap TID to leaf");
-                    result = false;
-                    goto cleanup;
-                }
+                /*
+                 * TID is stored at the NODE level, not at the edge level.
+                 * The TID was already added to root initially, and to each node
+                 * we walked down to. The leaf edge's destination is InvalidBlockNumber
+                 * since it's a leaf - we don't store TIDs via edges.
+                 */
 
                 /* Set suffix link from previous internal node */
                 if (lastNewInternalNode != InvalidBlockNumber &&
@@ -217,6 +274,15 @@ bool streeinserttuple(Relation index, STreeBuildState *state,
                         goto cleanup;
                     }
                 }
+                else
+                {
+                    /*
+                     * At root with activeLength == 0: we just inserted a new leaf edge.
+                     * The current suffix is fully handled. Break out of the remainder loop
+                     * to continue with the next character in the outer loop.
+                     */
+                    break;
+                }
             }
             else
             {
@@ -226,18 +292,12 @@ bool streeinserttuple(Relation index, STreeBuildState *state,
                 STreeEdgeInsideData *edgeData = streeGetEdgeData(activeNode.page, edgeId);
                 int edgeLabelCharLen = getEdgeLabelCharLength(edgeData);
 
-                /* Get character at activeLength position in the edge label */
                 pg_wchar edgeCharAtPos;
                 
                 if (activeLength < edgeLabelCharLen)
-                {
                     edgeCharAtPos = getEdgeLabelCharAt(edgeData, activeLength);
-                }
                 else
-                {
-                    /* activeLength >= edge length - should have walked down */
                     edgeCharAtPos = 0;
-                }
 
                 if (edgeCharAtPos == currentChar)
                 {
@@ -293,13 +353,23 @@ bool streeinserttuple(Relation index, STreeBuildState *state,
                     }
 
                     /*
-                     * Now create leaf edge from new internal node.
+                     * Add TID to the NEW INTERNAL NODE.
+                     * This is crucial for substring matching!
                      */
                     Buffer newInternalBuffer = ReadBuffer(index, newInternalBlkno);
                     LockBuffer(newInternalBuffer, BUFFER_LOCK_EXCLUSIVE);
                     Page newInternalPage = BufferGetPage(newInternalBuffer);
 
-                    const char *leafLabelStart = charStart;  /* From current char */
+                    if (!streeAddHeapTidToNode(index, newInternalBuffer, tid))
+                    {
+                        UnlockReleaseBuffer(newInternalBuffer);
+                        elog(WARNING, "Failed to add heap TID to new internal node");
+                        result = false;
+                        goto cleanup;
+                    }
+
+                    /* Create leaf edge from new internal node */
+                    const char *leafLabelStart = charStart;
                     int leafLabelBytes = strEnd - leafLabelStart;
 
                     START_CRIT_SECTION();
@@ -325,11 +395,15 @@ bool streeinserttuple(Relation index, STreeBuildState *state,
 
                     END_CRIT_SECTION();
 
-                    /* Store the heap TID in the new leaf's data page */
-                    if (!streeAddHeapTid(index, newInternalBuffer, leafEdge, tid))
+                    /*
+                     * Add TID to the new internal node we just created.
+                     * This is the node that will be traversed for any suffix
+                     * starting with the split prefix.
+                     */
+                    if (!streeAddHeapTidToNode(index, newInternalBuffer, tid))
                     {
                         UnlockReleaseBuffer(newInternalBuffer);
-                        elog(WARNING, "Failed to add heap TID after split");
+                        elog(WARNING, "Failed to add heap TID to new internal node after split");
                         result = false;
                         goto cleanup;
                     }
@@ -353,7 +427,6 @@ bool streeinserttuple(Relation index, STreeBuildState *state,
                     /* Remember this internal node for suffix link chaining */
                     lastNewInternalNode = newInternalBlkno;
                     lastNewInternalBuffer = newInternalBuffer;
-                    /* Note: Don't unlock - we need it for suffix link */
 
                     remainder--;
 
@@ -383,16 +456,26 @@ bool streeinserttuple(Relation index, STreeBuildState *state,
         state->indexedTuples++;
 
 cleanup:
-    /* Release any held buffers */
+    elog(LOG, "streeinserttuple: cleanup starting");
     if (BufferIsValid(lastNewInternalBuffer))
+    {
+        elog(LOG, "streeinserttuple: releasing lastNewInternalBuffer");
         UnlockReleaseBuffer(lastNewInternalBuffer);
+    }
 
     if (activeNode.buffer != rootBuffer && BufferIsValid(activeNode.buffer))
+    {
+        elog(LOG, "streeinserttuple: releasing activeNode.buffer");
         UnlockReleaseBuffer(activeNode.buffer);
+    }
 
     if (BufferIsValid(rootBuffer))
+    {
+        elog(LOG, "streeinserttuple: releasing rootBuffer");
         UnlockReleaseBuffer(rootBuffer);
+    }
 
+    elog(LOG, "streeinserttuple: cleanup complete, returning %s", result ? "true" : "false");
     CHECK_FOR_INTERRUPTS();
 
     return result;
@@ -420,39 +503,55 @@ insertEdgeSorted(Page page, pg_wchar firstChar, const char *labelData,
     STreeEdgeIdArrayHeader *header;
     STreeEdgeIdData        *edgeIds;
     STreeEdgeInsideData    *edgeInside;
+    STreeNodePageOpaque     opaque;
     uint16                  numOfEdges;
     uint16                  insertPos;
     Size                    spaceNeeded;
-    Size                    freeSpace;
     Offset                  edgeDataOffset;
+    Offset                  specialOffset;
+    Offset                  lowestOffset;
+    Offset                  edgeIdsEnd;
 
     Assert(page != NULL);
-    Assert(labelData != NULL || labelLen == 0);
 
     header = STreePageGetEdgeIdHeader(page);
     numOfEdges = header->numberOfEdges;
     edgeIds = STreePageGetEdgeIds(page);
+    opaque = (STreeNodePageOpaque) PageGetSpecialPointer(page);
 
-    /*
-     * Calculate space needed:
-     * - One new STreeEdgeIdData in the edge ID array
-     * - The edge inside data (header + label bytes)
-     */
-    spaceNeeded = sizeof(STreeEdgeIdData) + 
-                  SizeOfSTreeEdgeInsideData + labelLen;
+    /* Calculate space needed */
+    spaceNeeded = sizeof(STreeEdgeIdData) + SizeOfSTreeEdgeInsideData + labelLen;
 
-    /* Check if we have enough free space */
-    freeSpace = PageGetFreeSpace(page);
-    if (freeSpace < spaceNeeded)
+    /* Calculate where special pointer starts */
+    specialOffset = (char *) opaque - (char *) page;
+
+    /* Find lowest existing edge data offset */
+    lowestOffset = specialOffset;
+    for (uint16 i = 0; i < numOfEdges; i++)
     {
-        /* Not enough space - caller needs to handle page split */
+        if (edgeIds[i].realEdgeOffset < lowestOffset)
+            lowestOffset = edgeIds[i].realEdgeOffset;
+    }
+
+    /* Calculate where edge IDs array ends */
+    edgeIdsEnd = ((char *) PageGetContents(page) - (char *) page) +
+                 sizeof(STreeEdgeIdArrayHeader) +
+                 ((numOfEdges + 1) * sizeof(STreeEdgeIdData));
+
+    /* New edge data goes below existing edge data */
+    edgeDataOffset = lowestOffset - (SizeOfSTreeEdgeInsideData + labelLen);
+
+    /* Check if we have enough space */
+    if (edgeIdsEnd > edgeDataOffset)
+    {
+        /* Page full */
         return NULL;
     }
 
-    /* Find the position to insert to maintain sorted order */
+    /* Find insertion position */
     insertPos = findEdgeInsertPosition(edgeIds, numOfEdges, firstChar);
 
-    /* Check if edge with same firstChar already exists */
+    /* Check for duplicate */
     if (insertPos < numOfEdges && 
         EdgeIdGetFirstChar(&edgeIds[insertPos]) == firstChar)
     {
@@ -460,266 +559,37 @@ insertEdgeSorted(Page page, pg_wchar firstChar, const char *labelData,
         return NULL;
     }
 
-    /*
-     * Allocate space for the edge data (STreeEdgeInsideData).
-     * Edge data grows from the end of the page (before special space).
-     * 
-     * TODO: You need to track the lowest used offset. For now, calculate it.
-     */
-    STreeNodePageOpaque opaque = (STreeNodePageOpaque) PageGetSpecialPointer(page);
-    Offset specialOffset = (char *) opaque - (char *) page;
-    
-    /* Calculate where to put new edge data */
-    edgeDataOffset = specialOffset - (SizeOfSTreeEdgeInsideData + labelLen);
-    
-    /* TODO: Account for existing edge data - need to track lowest offset */
-
-    edgeInside = (STreeEdgeInsideData *) ((char *) page + edgeDataOffset);
-
     /* Initialize edge inside data */
+    edgeInside = (STreeEdgeInsideData *) ((char *) page + edgeDataOffset);
     edgeInside->destinationNode = destBlock;
     edgeInside->labelLength = labelLen;
-    
-    /* Copy label data */
-    if (labelLen > 0)
+
+    if (labelLen > 0 && labelData != NULL)
         memcpy(edgeInside->label, labelData, labelLen);
 
-    /*
-     * Shift existing edge IDs to make room for the new one.
-     */
+    /* Shift existing edge IDs to make room */
     if (insertPos < numOfEdges)
     {
-        memmove(&edgeIds[insertPos + 1], 
-                &edgeIds[insertPos], 
+        memmove(&edgeIds[insertPos + 1],
+                &edgeIds[insertPos],
                 (numOfEdges - insertPos) * sizeof(STreeEdgeIdData));
     }
 
-    /* Initialize the new edge ID (no destinationNode here!) */
+    /* Initialize new edge ID */
     edgeIds[insertPos].firstChar = firstChar;
     edgeIds[insertPos].realEdgeOffset = edgeDataOffset;
     edgeIds[insertPos].realEdgeDataLength = SizeOfSTreeEdgeInsideData + labelLen;
 
-    /* Update edge count */
+    /* Update count */
     header->numberOfEdges++;
+
+    /*
+     * Update page boundaries:
+     * - pd_lower: end of edge IDs array (grows upward)
+     * - pd_upper: start of edge data (grows downward)
+     */
+    ((PageHeader) page)->pd_lower = edgeIdsEnd;
+    ((PageHeader) page)->pd_upper = edgeDataOffset;
 
     return &edgeIds[insertPos];
 }
-
-/*
- * streeAddHeapTid - Add a heap TID to a leaf node.
- *
- * Leaf nodes in the suffix tree point to data pages that store the actual
- * heap TIDs. This function adds a TID to the appropriate data page.
- *
- * Parameters:
- *   index       - The relation
- *   leafPage    - The leaf node page (edge node with destinationNode = InvalidBlockNumber)
- *   edgeId      - The edge ID for the leaf
- *   tid         - The heap TID to store
- *
- * Returns:
- *   true on success, false if we need to allocate a new data page
- */
-bool
-streeAddHeapTid(Relation index, Buffer leafBuffer, STreeEdgeIdData *edgeId, 
-                ItemPointer tid)
-{
-    Page                    leafPage;
-    STreeEdgeInsideData    *edgeData;
-    BlockNumber             dataPageBlkno;
-    Buffer                  dataBuffer;
-    Page                    dataPage;
-    STreeNodeTupleDataEntries *header;
-    STreeNodeTuple          tuples;
-    Size                    tupleSize;
-    Size                    spaceNeeded;
-    Size                    freeSpace;
-
-    Assert(BufferIsValid(leafBuffer));
-    Assert(edgeId != NULL);
-    Assert(tid != NULL);
-
-    leafPage = BufferGetPage(leafBuffer);
-    edgeData = streeGetEdgeData(leafPage, edgeId);
-
-    /* 
-     * For leaf edges, destinationNode points to the data page.
-     * If InvalidBlockNumber, we need to allocate one.
-     */
-    dataPageBlkno = edgeData->destinationNode;
-
-    if (dataPageBlkno == InvalidBlockNumber)
-    {
-        /* Allocate new data page */
-        dataBuffer = streeAllocateDataPage(index, leafBuffer, edgeId);
-        if (!BufferIsValid(dataBuffer))
-            return false;
-        
-        dataPageBlkno = BufferGetBlockNumber(dataBuffer);
-    }
-    else
-    {
-        /* Read existing data page */
-        dataBuffer = ReadBuffer(index, dataPageBlkno);
-        LockBuffer(dataBuffer, BUFFER_LOCK_EXCLUSIVE);
-    }
-
-    dataPage = BufferGetPage(dataBuffer);
-    header = (STreeNodeTupleDataEntries *) PageGetContents(dataPage);
-
-    /*
-     * Calculate space needed for the new tuple.
-     * We use IndexTupleData which stores the TID.
-     */
-    tupleSize = sizeof(IndexTupleData);
-    spaceNeeded = MAXALIGN(tupleSize);
-    freeSpace = PageGetFreeSpace(dataPage);
-
-    if (freeSpace < spaceNeeded)
-    {
-        /*
-         * Data page is full - need to chain to a new page.
-         */
-        UnlockReleaseBuffer(dataBuffer);
-        dataBuffer = streeAllocateOverflowDataPage(index, leafBuffer, edgeId, dataPageBlkno);
-        if (!BufferIsValid(dataBuffer))
-            return false;
-        
-        dataPage = BufferGetPage(dataBuffer);
-        header = (STreeNodeTupleDataEntries *) PageGetContents(dataPage);
-    }
-
-    START_CRIT_SECTION();
-
-    /*
-     * Get pointer to tuple array and add new entry.
-     */
-    tuples = (STreeNodeTuple) (((char *) header) + STREE_NODE_TUPLE_DATA_ENTRIES_HEADER_SIZE);
-    
-    /* Add new tuple at the end */
-    STreeNodeTuple newTuple = &tuples[header->numberOfEntries];
-    
-    /* Initialize the index tuple with the heap TID */
-    newTuple->t_tid = *tid;
-    newTuple->t_info = 0;  /* No additional data beyond TID */
-
-    header->numberOfEntries++;
-
-    MarkBufferDirty(dataBuffer);
-
-    END_CRIT_SECTION();
-
-    UnlockReleaseBuffer(dataBuffer);
-
-    return true;
-}
-
-
-
-// bool streeinsertchar(Relation index, STreeBuildState *state,
-//                  ItemPointer tid, Datum *values, bool *isnull) 
-// {
-//     bool			isSuccess = true;
-//     Datum			valueToInsert;
-//     int				valueSize = 0;
-//     STreePageInfo	current,
-//                     parent;
-
-//     if (!isnull) {
-//         //(attType.attlen == -1) // type can be varlena and needs detoasting
-//         //valueToInsert = PointerGetDatum(PG_DETOAST_DATUM(values[streeKeyColumn]));
-//         valueToInsert = values[streeKeyColumn];
-//     } else {
-//         valueToInsert = (Datum) 0; // null value
-//     }
-
-//     //CalculateTupleSize ??
-//     /**
-//      * TODO:
-//      * Check if the value size is not exceeding the maximum allowed size
-//      * for indexing. If it does, raise an error.
-//      */
-//     // if (valueSize > MAX_INDEXABLE_SIZE) {
-
-//     current.blkno = isnull ? STREE_NULL_BLK : STREE_ROOT_BLK;
-//     current.buffer = InvalidBuffer;
-//     current.page = NULL;
-//     current.offnum = FirstOffsetNumber;
-//     current.node = -1;
-
-//     parent.blkno = InvalidBlockNumber;
-//     parent.buffer = InvalidBuffer;
-//     parent.page = NULL;
-//     parent.offnum = InvalidOffsetNumber;
-//     parent.node = -1;
-
-
-//     CHECK_FOR_INTERRUPTS();
-
-//     for (;;) {
-
-//         if (INTERRUPTS_PENDING_CONDITION())
-// 		{
-// 			isSuccess = false;
-// 			break;
-// 		}
-//     }
-
-//     if (current.buffer == InvalidBlockNumber)
-//     {
-//         // get the buffer for the current page
-//     }
-//     else if (parent.buffer == InvalidBuffer)
-//     {
-//         // get the buffer for the parent page
-//         current.buffer = ReadBuffer(index, current.blkno);
-//         LockBuffer(current.buffer, BUFFER_LOCK_EXCLUSIVE);
-//     }
-//     else if (current.blkno != parent.blkno)
-//     {
-//         // get the buffer for the current page
-//         current.buffer = ReadBuffer(index, current.blkno);
-//         // Attempt to acquire lock on child page.  We must beware of
-//         // deadlock against another insertion process descending from that
-//         // page to our parent page (see README).  If we fail to get lock,
-//         // we release our parent lock and try again.
-//         if (!ConditionalLockBuffer(current.buffer))
-//         {
-//             ReleaseBuffer(current.buffer);
-// 			UnlockReleaseBuffer(parent.buffer);
-// 			return false;
-//         }
-//     }
-//     else
-// 	{
-// 		/* inner tuple can be stored on the same page as parent one */
-// 		current.buffer = parent.buffer;
-// 	}
-//     current.page = BufferGetPage(current.buffer);
-
-
-
-//     // Insert code starts here
-    
-
-
-    
-//     /**
-//      * TODO:
-//      * Release any buffers we're still holding.  Beware of possibility that
-//      * current and parent reference same buffer.
-//      */
-
-    
-//     Assert(INTERRUPTS_CAN_BE_PROCESSED());
-
-//     /*
-// 	 * Finally, check for interrupts again.  If there was a query cancel,
-// 	 * ProcessInterrupts() will be able to throw the error here.  If it was
-// 	 * some other kind of interrupt that can just be cleared, return false to
-// 	 * tell our caller to retry.
-// 	 */
-// 	CHECK_FOR_INTERRUPTS();
-    
-//     return isSuccess;    
-// }

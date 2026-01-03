@@ -2,11 +2,14 @@
 
 #include "access/stree_private.h"
 #include "access/genam.h"
+#include "access/relscan.h"
 #include "access/xloginsert.h"
 #include "common/int.h"
 #include "common/pg_prng.h"
 #include "miscadmin.h"
 #include "storage/bufmgr.h"
+#include "utils/builtins.h"
+#include "utils/memutils.h"
 #include "utils/rel.h"
 /** 
  * For UTF-8 support
@@ -98,106 +101,48 @@ walkDown(Relation index,
          const char *strEnd,
          Buffer rootBuffer)
 {
-    STreeEdgeIdData    *edgeId;
-    STreeEdgeInsideData *edgeData;
-    pg_wchar            activeEdgeChar;
-    const char         *activeEdgePtr;
-    int                 edgeLabelCharLen;
-    int                 i;
 
     Assert(activeNode != NULL);
     Assert(activeNode->page != NULL);
     Assert(*activeLength > 0);
 
-    /*
-     * Get the character at activeEdgeCharIdx position in the original string.
-     * We need to walk the string to find the byte offset for UTF-8.
-     */
-    activeEdgePtr = strValue;
-    for (i = 0; i < *activeEdgeCharIdx && activeEdgePtr < strEnd; i++)
-    {
-        activeEdgePtr += pg_mblen(activeEdgePtr);
-    }
-
-    if (activeEdgePtr >= strEnd)
-    {
-        /* Shouldn't happen - active edge points past string end */
-        return false;
-    }
-
-    /* Get the Unicode codepoint at active edge position */
-    pg_mb2wchar_with_len((const unsigned char *) activeEdgePtr,
-                         &activeEdgeChar,
-                         pg_mblen(activeEdgePtr));
-
-    /* Find the edge starting with this character */
-    edgeId = lookupEdgeByFirstChar(activeNode->page, activeEdgeChar);
+    // 1. Get the edge starting with character at activeEdgeCharIdx
+    pg_wchar activeEdgeChar = getCharAtPosition(strValue, strEnd, *activeEdgeCharIdx);
+    STreeEdgeIdData *edgeId = lookupEdgeByFirstChar(activeNode->page, activeEdgeChar);
+    
     if (edgeId == NULL)
-    {
-        /* No edge found - this shouldn't happen if called correctly */
-        return false;
-    }
-
-    /* Get the edge data */
-    edgeData = streeGetEdgeData(activeNode->page, edgeId);
-
-    /* Calculate edge label length in characters (not bytes) */
-    edgeLabelCharLen = pg_mbstrlen_with_len(edgeData->label, edgeData->labelLength);
-
-    /*
-     * Check if we need to walk down.
-     * If activeLength >= edge label length, we need to move to the child node.
-     */
+        return false;  // No edge - can't walk
+    
+    // 2. Get edge label length in characters
+    STreeEdgeInsideData *edgeData = streeGetEdgeData(activeNode->page, edgeId);
+    int edgeLabelCharLen = getEdgeLabelCharLength(edgeData);
+    
+    // 3. Check if we need to walk down
     if (*activeLength < edgeLabelCharLen)
-    {
-        /* Don't walk down - we're in the middle of this edge */
-        return false;
-    }
-
-    /*
-     * Walk down to child node.
-     */
+        return false;  // We're inside this edge - stop
+    
+    // 4. Walk down to child node
     BlockNumber childBlkno = edgeData->destinationNode;
-
     if (childBlkno == InvalidBlockNumber)
-    {
-        /* This is a leaf edge - shouldn't walk down further */
-        return false;
-    }
-
-    /* Acquire buffer for child node */
+        return false;  // Leaf - can't walk further
+    
+    // 5. Acquire child buffer and update active node
     Buffer childBuffer = ReadBuffer(index, childBlkno);
-
-    /* Try to lock child buffer - use conditional to avoid deadlock */
-    if (!ConditionalLockBuffer(childBuffer))
-    {
-        /*
-         * Could not acquire lock - deadlock prevention.
-         * Release child buffer and return false to let caller retry.
-         */
-        ReleaseBuffer(childBuffer);
-        return false;
-    }
-
-    /*
-     * Successfully acquired child buffer.
-     * Release old buffer (unless it's root) and update active node.
-     */
+    LockBuffer(childBuffer, BUFFER_LOCK_EXCLUSIVE);
+    
+    // Release old buffer (unless it's root)
     if (activeNode->buffer != rootBuffer && BufferIsValid(activeNode->buffer))
-    {
         UnlockReleaseBuffer(activeNode->buffer);
-    }
-
-    /* Update active node to point to child */
+    
     activeNode->buffer = childBuffer;
     activeNode->page = BufferGetPage(childBuffer);
     activeNode->blockNumber = childBlkno;
-
-    /* Update active edge and length */
+    
+    // 6. Update active edge and length
     *activeEdgeCharIdx += edgeLabelCharLen;
     *activeLength -= edgeLabelCharLen;
-
-    return true;
+    
+    return true;  // We walked down - caller should continue loop
 }
 
 /*
@@ -212,7 +157,7 @@ walkDown(Relation index,
  * Returns:
  *   true on success, false if we need to retry (lock failure)
  */
-static bool
+bool
 followSuffixLink(Relation index,
                  STreeActiveNode *activeNode,
                  Buffer rootBuffer,
@@ -279,56 +224,362 @@ followSuffixLink(Relation index,
 }
 
 /*
- * streeGetDataPageTids - Iterate over all TIDs stored in a leaf's data pages.
- *
- * This is used during index scans to retrieve matching heap TIDs.
- *
- * Parameters:
- *   index        - The relation
- *   dataBlkno    - Block number of the first data page
- *   callback     - Function to call for each TID
- *   callbackArg  - Argument passed to callback
- *
- * Returns:
- *   Number of TIDs processed
+ * streeFindBufferForPattern - Find the node buffer that corresponds to the
+ * given pattern. Returns a pinned & share-locked Buffer for the node that
+ * represents all occurrences of the pattern (caller must UnlockReleaseBuffer
+ * it), or InvalidBuffer if pattern not found.
  */
-int
-streeGetDataPageTids(Relation index, BlockNumber dataBlkno,
-                     void (*callback)(ItemPointer tid, void *arg), void *callbackArg)
+Buffer
+streeFindBufferForPattern(Relation index, const char *pattern, int patternBytes)
 {
-    int                     totalTids = 0;
-    BlockNumber             currentBlkno = dataBlkno;
+    Buffer      rootBuffer;
+    STreeActiveNode active;
+    const char  *pcur = pattern;
+    const char  *pend = pattern + patternBytes;
 
-    while (currentBlkno != InvalidBlockNumber)
+    /* Acquire root buffer */
+    rootBuffer = ReadBuffer(index, STREE_ROOT_BLK);
+    LockBuffer(rootBuffer, BUFFER_LOCK_SHARE);
+
+    active.blockNumber = STREE_ROOT_BLK;
+    active.buffer = rootBuffer;
+    active.page = BufferGetPage(rootBuffer);
+
+    /* Walk the pattern character-by-character */
+    while (pcur < pend)
     {
-        Buffer                  buffer;
-        Page                    page;
-        STreeNodePageOpaque     opaque;
-        STreeNodeTupleDataEntries *header;
-        STreeNodeTuple          tuples;
-        uint32                  i;
+        /* Peek next character from pattern */
+        const char *tmp = pcur;
+        pg_wchar patChar = streeGetNextChar(&tmp, pend);
 
-        buffer = ReadBuffer(index, currentBlkno);
-        LockBuffer(buffer, BUFFER_LOCK_SHARE);
-        page = BufferGetPage(buffer);
-
-        header = (STreeNodeTupleDataEntries *) PageGetContents(page);
-        tuples = (STreeNodeTuple) (((char *) header) + STREE_NODE_TUPLE_DATA_ENTRIES_HEADER_SIZE);
-
-        /* Process each TID */
-        for (i = 0; i < header->numberOfEntries; i++)
+        /* Find edge starting with this character */
+        STreeEdgeIdData *edgeId = lookupEdgeByFirstChar(active.page, patChar);
+        if (edgeId == NULL)
         {
-            if (callback)
-                callback(&tuples[i].t_tid, callbackArg);
-            totalTids++;
+            /* No matching edge */
+            UnlockReleaseBuffer(active.buffer);
+            return InvalidBuffer;
         }
 
-        /* Move to next page in chain */
-        opaque = (STreeNodePageOpaque) PageGetSpecialPointer(page);
-        currentBlkno = opaque->nextSiblingNode;
+        STreeEdgeInsideData *edgeData = streeGetEdgeData(active.page, edgeId);
+        int edgeChars = getEdgeLabelCharLength(edgeData);
 
-        UnlockReleaseBuffer(buffer);
+        /* consume the first char we already peeked */
+        pcur = tmp;
+
+        /* Compare remaining characters of the edge label */
+        for (int i = 1; i < edgeChars; i++)
+        {
+            if (pcur >= pend)
+            {
+                /* Pattern ends inside this edge: occurrences are under the edge's child */
+                if (edgeData->destinationNode != InvalidBlockNumber)
+                {
+                    Buffer childBuf = ReadBuffer(index, edgeData->destinationNode);
+                    LockBuffer(childBuf, BUFFER_LOCK_SHARE);
+                    /* release previous node buffer */
+                    UnlockReleaseBuffer(active.buffer);
+                    return childBuf;
+                }
+                else
+                {
+                    /* Edge goes to nowhere (leaf) — return current node */
+                    return active.buffer;
+                }
+            }
+
+            /* get next pattern character */
+            const char *tmp2 = pcur;
+            pg_wchar pch = streeGetNextChar(&tmp2, pend);
+            pg_wchar edgech = getEdgeLabelCharAt(edgeData, i);
+
+            if (pch != edgech)
+            {
+                /* mismatch */
+                UnlockReleaseBuffer(active.buffer);
+                return InvalidBuffer;
+            }
+
+            pcur = tmp2;
+        }
+
+        /* We've matched full edge label; move to child node */
+        if (edgeData->destinationNode == InvalidBlockNumber)
+        {
+            /* matched full label, but no child (leaf). If pattern still remains -> no match */
+            if (pcur < pend)
+            {
+                UnlockReleaseBuffer(active.buffer);
+                return InvalidBuffer;
+            }
+            /* pattern ended exactly at leaf edge — return current node */
+            return active.buffer;
+        }
+
+        /* advance to child node */
+        BlockNumber child = edgeData->destinationNode;
+        Buffer childBuf = ReadBuffer(index, child);
+        LockBuffer(childBuf, BUFFER_LOCK_SHARE);
+
+        /* release previous node buffer */
+        UnlockReleaseBuffer(active.buffer);
+
+        active.blockNumber = child;
+        active.buffer = childBuf;
+        active.page = BufferGetPage(childBuf);
     }
 
-    return totalTids;
+    /* Pattern exhausted; active.buffer is the node for the pattern */
+    return active.buffer;
+}
+
+
+/*
+ * streeFindAndCollect - Find pattern and collect TIDs via callback.
+ * Returns number of TIDs processed.
+ */
+int
+streeFindAndCollect(Relation index, const char *pattern, int patternBytes,
+                    void (*callback)(ItemPointer tid, void *arg), void *callbackArg)
+{
+    Buffer nodeBuf = streeFindBufferForPattern(index, pattern, patternBytes);
+    int total = 0;
+
+    if (!BufferIsValid(nodeBuf))
+        return 0;
+
+    /* Collect TIDs stored at this node */
+    total = streeGetNodeTids(index, nodeBuf, callback, callbackArg);
+
+    /* release node buffer */
+    UnlockReleaseBuffer(nodeBuf);
+
+    return total;
+}
+
+
+/* ============================================================
+ * Index Access Method Scan Functions
+ * ============================================================ */
+
+/*
+ * Callback for collecting TIDs during search
+ */
+static void
+streeCollectTidCallback(ItemPointer tid, void *arg)
+{
+    STreeScanOpaque so = (STreeScanOpaque) arg;
+    
+    /* Grow array if needed */
+    if (so->numTids >= so->allocTids)
+    {
+        so->allocTids = (so->allocTids == 0) ? 64 : so->allocTids * 2;
+        so->tids = (ItemPointerData *) repalloc(so->tids, 
+                                                 so->allocTids * sizeof(ItemPointerData));
+    }
+    
+    /* Copy the TID */
+    so->tids[so->numTids++] = *tid;
+}
+
+/*
+ * streebeginscan - Begin an index scan
+ */
+IndexScanDesc
+streebeginscan(Relation rel, int nkeys, int norderbys)
+{
+    IndexScanDesc scan;
+    STreeScanOpaque so;
+    
+    /* No order by operators supported */
+    Assert(norderbys == 0);
+    
+    scan = RelationGetIndexScan(rel, nkeys, norderbys);
+    
+    /* Allocate private scan state */
+    so = (STreeScanOpaque) palloc0(sizeof(STreeScanOpaqueData));
+    so->tempCtx = AllocSetContextCreate(CurrentMemoryContext,
+                                        "STree scan temporary context",
+                                        ALLOCSET_DEFAULT_SIZES);
+    initSTreeState(&so->streestate, rel);
+    
+    so->pattern = NULL;
+    so->patternLen = 0;
+    so->tids = NULL;
+    so->numTids = 0;
+    so->allocTids = 0;
+    so->curTid = 0;
+    so->searchDone = false;
+    so->matchedNodeBuf = InvalidBuffer;
+    
+    scan->opaque = so;
+    
+    return scan;
+}
+
+/*
+ * Extract pattern from scan key - handles LIKE '%pattern%' format
+ * Returns the substring between the wildcards (or the whole string if no wildcards)
+ */
+static char *
+streeExtractPattern(ScanKey key, int *patternLen)
+{
+    char   *pattern;
+    char   *result;
+    int     len;
+    int     startPos = 0;
+    int     endPos;
+    
+    if (key == NULL || key->sk_argument == 0)
+        return NULL;
+    
+    /* Get the pattern string from the Datum */
+    pattern = TextDatumGetCString(key->sk_argument);
+    len = strlen(pattern);
+    
+    if (len == 0)
+    {
+        pfree(pattern);
+        return NULL;
+    }
+    
+    /* Handle leading % */
+    if (pattern[0] == '%')
+        startPos = 1;
+    
+    /* Handle trailing % */
+    endPos = len;
+    if (len > 0 && pattern[len - 1] == '%')
+        endPos = len - 1;
+    
+    /* Extract the pattern between wildcards */
+    *patternLen = endPos - startPos;
+    if (*patternLen <= 0)
+    {
+        pfree(pattern);
+        return NULL;
+    }
+    
+    result = palloc(*patternLen + 1);
+    memcpy(result, pattern + startPos, *patternLen);
+    result[*patternLen] = '\0';
+    
+    pfree(pattern);
+    return result;
+}
+
+/*
+ * streerescan - Restart an index scan
+ */
+void
+streerescan(IndexScanDesc scan, ScanKey scankey, int nscankeys,
+            ScanKey orderbys, int norderbys)
+{
+    STreeScanOpaque so = (STreeScanOpaque) scan->opaque;
+    MemoryContext oldCtx;
+    
+    /* Reset scan state */
+    so->curTid = 0;
+    so->numTids = 0;
+    so->searchDone = false;
+    
+    /* Release any held buffer */
+    if (BufferIsValid(so->matchedNodeBuf))
+    {
+        ReleaseBuffer(so->matchedNodeBuf);
+        so->matchedNodeBuf = InvalidBuffer;
+    }
+    
+    /* Free old pattern if any */
+    if (so->pattern != NULL)
+    {
+        pfree(so->pattern);
+        so->pattern = NULL;
+        so->patternLen = 0;
+    }
+    
+    /* Copy scan keys */
+    if (scankey && nscankeys > 0)
+    {
+        memmove(scan->keyData, scankey, nscankeys * sizeof(ScanKeyData));
+    }
+    
+    /* Extract pattern from first scan key */
+    if (nscankeys > 0)
+    {
+        oldCtx = MemoryContextSwitchTo(so->tempCtx);
+        so->pattern = streeExtractPattern(&scan->keyData[0], &so->patternLen);
+        MemoryContextSwitchTo(oldCtx);
+    }
+}
+
+/*
+ * streegettuple - Get next matching tuple from the index
+ */
+bool
+streegettuple(IndexScanDesc scan, ScanDirection direction)
+{
+    STreeScanOpaque so = (STreeScanOpaque) scan->opaque;
+    
+    /* We don't support backward scans */
+    if (ScanDirectionIsBackward(direction))
+        elog(ERROR, "suffix tree index does not support backward scans");
+    
+    /* Perform search if not done yet */
+    if (!so->searchDone)
+    {
+        so->searchDone = true;
+        so->numTids = 0;
+        so->curTid = 0;
+        
+        /* Search only if we have a pattern */
+        if (so->pattern != NULL && so->patternLen > 0)
+        {
+            /* Collect all matching TIDs */
+            streeFindAndCollect(scan->indexRelation,
+                               so->pattern,
+                               so->patternLen,
+                               streeCollectTidCallback,
+                               so);
+        }
+    }
+    
+    /* Return next TID if available */
+    if (so->curTid < so->numTids)
+    {
+        scan->xs_heaptid = so->tids[so->curTid];
+        so->curTid++;
+        scan->xs_recheck = true;  /* Need recheck for exact LIKE match */
+        return true;
+    }
+    
+    return false;
+}
+
+/*
+ * streeendscan - End an index scan
+ */
+void
+streeendscan(IndexScanDesc scan)
+{
+    STreeScanOpaque so = (STreeScanOpaque) scan->opaque;
+    
+    /* Release any held buffer */
+    if (BufferIsValid(so->matchedNodeBuf))
+    {
+        ReleaseBuffer(so->matchedNodeBuf);
+        so->matchedNodeBuf = InvalidBuffer;
+    }
+    
+    /* Free allocated memory */
+    if (so->tids != NULL)
+        pfree(so->tids);
+    
+    if (so->pattern != NULL)
+        pfree(so->pattern);
+    
+    /* Delete temporary context */
+    MemoryContextDelete(so->tempCtx);
+    
+    pfree(so);
 }

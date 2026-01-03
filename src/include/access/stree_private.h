@@ -9,6 +9,10 @@
 
 #include "access/itup.h"
 #include "access/amapi.h"
+#include "access/genam.h"
+#include "nodes/execnodes.h"
+#include "nodes/pathnodes.h"
+#include "storage/bufmgr.h"
 #include "mb/pg_wchar.h"
 
 /* Tunning points */
@@ -38,6 +42,31 @@ typedef struct STreeBuildState {
     MemoryContext tmpMemCtx;		/* per-tuple temporary context */
     STreeActiveNode activeNode;   /* currently active node during insertion */
 } STreeBuildState;
+
+/*
+ * Scan opaque data - private state for index scans
+ */
+typedef struct STreeScanOpaqueData
+{
+    STreeState  streestate;     /* index state */
+    MemoryContext tempCtx;      /* temporary memory context for scan */
+    
+    /* Pattern to search for */
+    char       *pattern;        /* search pattern (copied) */
+    int         patternLen;     /* pattern length in bytes */
+    
+    /* Result TIDs */
+    ItemPointerData *tids;      /* array of matching TIDs */
+    int         numTids;        /* number of TIDs found */
+    int         allocTids;      /* allocated size of tids array */
+    int         curTid;         /* current position in tids array */
+    
+    /* Scan state */
+    bool        searchDone;     /* have we completed the search? */
+    Buffer      matchedNodeBuf; /* buffer of matched node (if any) */
+} STreeScanOpaqueData;
+
+typedef STreeScanOpaqueData *STreeScanOpaque;
 
 #define STREE_MAGIC_NUMBER (0xC0FFEE42) // Used to identify memory corruption detection
 
@@ -142,10 +171,9 @@ typedef struct STreeEdgeIdArrayHeader
 
 typedef struct STreeEdgeIdData
 {
-    //pg_wchar firstChar; // for utf8 support?
     pg_wchar firstChar; // first character of the edge label
-    uint16  realEdgeOffset: 16; // offset of the edge in the page
-    uint16  realEdgeDataLength: 16; // length of the edge data
+    uint16  realEdgeOffset; // offset of the edge in the page
+    uint16  realEdgeDataLength; // length of the edge data
 } STreeEdgeIdData;
 
 typedef STreeEdgeIdData *STreeEdgeId;
@@ -175,7 +203,7 @@ typedef STreeEdgeInsideData *STreeEdgeInside;
 
 
 typedef struct STreeNodeTupleDataEntries {
-    unsigned int numberOfEntries: 32;   /* number of data items  */
+    uint32 numberOfEntries;   /* number of data items  */
     /*      * Followed immediately by: */
     /* - array of StreeNodeTupleData[numberOfEntries] */
 } STreeNodeTupleDataEntries;
@@ -359,6 +387,28 @@ extern void initSTreeState(STreeState *state, Relation index);
 extern bool streeinserttuple(Relation index, STreeBuildState *state,
                  ItemPointer tid, Datum *values, bool *isnull);
 
+/* Build functions */
+extern IndexBuildResult *streebuild(Relation heap, Relation index, IndexInfo *indexInfo);
+extern void streebuildempty(Relation index);
+extern bool streeinsert(Relation index, Datum *values, bool *isnull,
+                        ItemPointer ht_ctid, Relation heapRel,
+                        IndexUniqueCheck checkUnique,
+                        bool indexUnchanged, IndexInfo *indexInfo);
+
+/* Scan functions */
+extern IndexScanDesc streebeginscan(Relation rel, int nkeys, int norderbys);
+extern void streerescan(IndexScanDesc scan, ScanKey scankey, int nscankeys,
+                        ScanKey orderbys, int norderbys);
+extern bool streegettuple(IndexScanDesc scan, ScanDirection direction);
+extern void streeendscan(IndexScanDesc scan);
+
+/* Validation and cost estimation */
+extern bool streevalidate(Oid opclassoid);
+extern void streecostestimate(PlannerInfo *root, IndexPath *path,
+                              double loop_count, Cost *indexStartupCost,
+                              Cost *indexTotalCost, Selectivity *indexSelectivity,
+                              double *indexCorrelation, double *indexPages);
+
 /* Edge operations */
 extern STreeEdgeIdData *lookupEdgeByFirstChar(Page page, pg_wchar firstChar);
 extern STreeEdgeIdData *insertEdgeSorted(Page page, pg_wchar firstChar, 
@@ -369,16 +419,132 @@ extern BlockNumber splitEdgeWithBuffer(Relation index, Buffer parentBuffer,
                                        BlockNumber *newNodeBlknoOut);
 extern bool walkDown(Relation index, STreeActiveNode *activeNode, int *activeEdgeCharIdx,
               int *activeLength, const char *strValue, const char *strEnd, Buffer rootBuffer);
+extern bool followSuffixLink(Relation index, STreeActiveNode *activeNode,
+                             Buffer rootBuffer, BlockNumber rootBlkno);
 
-/* Data page operations for storing heap TIDs */
-extern bool streeAddHeapTid(Relation index, Buffer leafBuffer, 
-                            STreeEdgeIdData *edgeId, ItemPointer tid);
-extern Buffer streeAllocateDataPage(Relation index, Buffer leafBuffer, 
-                                    STreeEdgeIdData *edgeId);
-extern Buffer streeAllocateOverflowDataPage(Relation index, Buffer leafBuffer,
-                                            STreeEdgeIdData *edgeId, 
+/* Search helpers */
+extern Buffer streeFindBufferForPattern(Relation index, const char *pattern, int patternBytes);
+extern int streeFindAndCollect(Relation index, const char *pattern, int patternBytes,
+                               void (*callback)(ItemPointer tid, void *arg), void *callbackArg);
+
+/* ============================================================
+ * Data page operations for storing heap TIDs
+ * ============================================================
+ * 
+ * TIDs are stored at the NODE level via opaque->itemPointersStart.
+ * This enables substring matching - every node stores TIDs for all
+ * strings that pass through it.
+ *
+ * Note: destinationNode in edges ALWAYS points to STREE_EDGE_NODE_PAGE
+ * (or InvalidBlockNumber for leaf edges with no child). TIDs are NOT
+ * stored via edges - they are stored via the node's itemPointersStart.
+ *
+ * Core functions:
+ *   - streeAddHeapTidToDataPage: Add TID to a data page chain
+ *   - streeAllocateDataPage: Allocate a new data page
+ *   - streeAllocateOverflowDataPage: Allocate overflow when full
+ *   - streeGetDataPageTids: Iterate TIDs in a data page chain
+ *
+ * Convenience wrapper:
+ *   - streeAddHeapTidToNode: Add TID via node's itemPointersStart
+ *   - streeGetNodeTids: Get TIDs from node's data pages
+ */
+
+/*
+ * streeAddHeapTidToDataPage - Add heap TID to a data page chain.
+ *
+ * This is the core function for adding TIDs. It handles:
+ * - Allocating the first data page if needed
+ * - Finding space in existing pages
+ * - Allocating overflow pages when full
+ *
+ * Parameters:
+ *   index           - The relation
+ *   dataPageBlknoPtr - Pointer to BlockNumber storing first data page
+ *                      (will be updated if new page allocated)
+ *   ownerBuffer     - Buffer that owns this data page link (for dirty marking)
+ *   tid             - The heap TID to store
+ *
+ * Returns:
+ *   true on success, false on failure
+ */
+extern bool streeAddHeapTidToDataPage(Relation index, 
+                                      BlockNumber *dataPageBlknoPtr,
+                                      Buffer ownerBuffer, 
+                                      ItemPointer tid);
+
+/*
+ * streeAllocateDataPage - Allocate a new data page for storing heap TIDs.
+ *
+ * Parameters:
+ *   index           - The relation
+ *   ownerBuffer     - Buffer that will own this data page
+ *   dataPageBlknoPtr - Where to store the new block number (updated on success)
+ *
+ * Returns:
+ *   Buffer of the new data page (locked), or InvalidBuffer on failure
+ */
+extern Buffer streeAllocateDataPage(Relation index, 
+                                    Buffer ownerBuffer,
+                                    BlockNumber *dataPageBlknoPtr);
+
+/*
+ * streeAllocateOverflowDataPage - Allocate overflow page when current is full.
+ *
+ * Parameters:
+ *   index         - The relation
+ *   ownerBuffer   - Buffer that owns the data page chain
+ *   currentBlkno  - Block number of the current (full) data page
+ *
+ * Returns:
+ *   Buffer of the new overflow page (locked), or InvalidBuffer on failure
+ */
+extern Buffer streeAllocateOverflowDataPage(Relation index, 
+                                            Buffer ownerBuffer,
                                             BlockNumber currentBlkno);
+
+/*
+ * streeGetDataPageTids - Iterate over all TIDs in a data page chain.
+ */
 extern int streeGetDataPageTids(Relation index, BlockNumber dataBlkno,
                                 void (*callback)(ItemPointer tid, void *arg), 
                                 void *callbackArg);
+
+/* ============================================================
+ * Convenience wrappers (inline functions)
+ * ============================================================ */
+
+/*
+ * streeAddHeapTidToNode - Add TID via node's itemPointersStart.
+ *
+ * This is the PRIMARY way to add TIDs. Every node (internal or leaf)
+ * stores TIDs via opaque->itemPointersStart.
+ */
+static inline bool
+streeAddHeapTidToNode(Relation index, Buffer nodeBuffer, ItemPointer tid)
+{
+    Page nodePage = BufferGetPage(nodeBuffer);
+    STreeNodePageOpaque opaque = (STreeNodePageOpaque) PageGetSpecialPointer(nodePage);
+    
+    return streeAddHeapTidToDataPage(index, &opaque->itemPointersStart, 
+                                     nodeBuffer, tid);
+}
+
+/*
+ * streeGetNodeTids - Get TIDs from node's data pages (via itemPointersStart).
+ */
+static inline int
+streeGetNodeTids(Relation index, Buffer nodeBuffer,
+                 void (*callback)(ItemPointer tid, void *arg), void *callbackArg)
+{
+    Page nodePage = BufferGetPage(nodeBuffer);
+    STreeNodePageOpaque opaque = (STreeNodePageOpaque) PageGetSpecialPointer(nodePage);
+    
+    if (opaque->itemPointersStart == InvalidBlockNumber)
+        return 0;
+    
+    return streeGetDataPageTids(index, opaque->itemPointersStart, 
+                                callback, callbackArg);
+}
+
 #endif   /* STREE_PRIVATE_H */

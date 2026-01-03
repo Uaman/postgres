@@ -486,6 +486,8 @@
   opcfamily => 'brin/box_inclusion_ops', opcintype => 'box',
   opckeytype => 'box' },
 
-# no brin opclass for the geometric types except box
+# suffix tree opclass for text substring search
+{ opcmethod => 'stree', opcname => 'text_ops',
+  opcfamily => 'stree/text_ops', opcintype => 'text' },
 
 ]

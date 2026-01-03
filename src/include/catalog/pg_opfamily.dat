@@ -304,5 +304,7 @@
   opfmethod => 'hash', opfname => 'multirange_ops' },
 { oid => '6158',
   opfmethod => 'gist', opfname => 'multirange_ops' },
+{ oid => '8902', oid_symbol => 'TEXT_STREE_FAM_OID',
+  opfmethod => 'stree', opfname => 'text_ops' },
 
 ]

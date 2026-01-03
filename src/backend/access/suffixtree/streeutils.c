@@ -21,6 +21,7 @@
 #include "access/xact.h"
 #include "catalog/pg_amop.h"
 #include "commands/vacuum.h"
+#include "miscadmin.h"
 #include "nodes/nodeFuncs.h"
 #include "parser/parse_coerce.h"
 #include "storage/bufmgr.h"
@@ -29,7 +30,9 @@
 #include "utils/fmgrprotos.h"
 #include "utils/index_selfuncs.h"
 #include "utils/lsyscache.h"
+#include "utils/memutils.h"
 #include "utils/rel.h"
+#include "utils/selfuncs.h"
 #include "utils/syscache.h"
 
 /**
@@ -39,7 +42,60 @@
 Datum
 streehandler(PG_FUNCTION_ARGS)
 {
+    IndexAmRoutine *amroutine = makeNode(IndexAmRoutine);
 
+    amroutine->amstrategies = 1;        /* we support LIKE operator */
+    amroutine->amsupport = 0;           /* no support functions needed */
+    amroutine->amoptsprocnum = 0;
+    amroutine->amcanorder = false;
+    amroutine->amcanorderbyop = false;
+    amroutine->amcanhash = false;
+    amroutine->amconsistentequality = false;
+    amroutine->amconsistentordering = false;
+    amroutine->amcanbackward = false;
+    amroutine->amcanunique = false;
+    amroutine->amcanmulticol = false;
+    amroutine->amoptionalkey = false;
+    amroutine->amsearcharray = false;
+    amroutine->amsearchnulls = false;
+    amroutine->amstorage = false;
+    amroutine->amclusterable = false;
+    amroutine->ampredlocks = false;
+    amroutine->amcanparallel = false;
+    amroutine->amcanbuildparallel = false;
+    amroutine->amcaninclude = false;
+    amroutine->amusemaintenanceworkmem = false;
+    amroutine->amsummarizing = false;
+    amroutine->amparallelvacuumoptions = VACUUM_OPTION_NO_PARALLEL;
+    amroutine->amkeytype = InvalidOid;
+
+    /* Required callbacks */
+    amroutine->ambuild = streebuild;
+    amroutine->ambuildempty = streebuildempty;
+    amroutine->aminsert = streeinsert;
+    amroutine->aminsertcleanup = NULL;
+    amroutine->ambulkdelete = NULL;         /* TODO: implement vacuum */
+    amroutine->amvacuumcleanup = NULL;      /* TODO: implement vacuum cleanup */
+    amroutine->amcanreturn = NULL;
+    amroutine->amcostestimate = streecostestimate;
+    amroutine->amgettreeheight = NULL;
+    amroutine->amoptions = NULL;
+    amroutine->amproperty = NULL;
+    amroutine->ambuildphasename = NULL;
+    amroutine->amvalidate = streevalidate;
+    amroutine->amadjustmembers = NULL;
+    amroutine->ambeginscan = streebeginscan;
+    amroutine->amrescan = streerescan;
+    amroutine->amgettuple = streegettuple;
+    amroutine->amgetbitmap = NULL;
+    amroutine->amendscan = streeendscan;
+    amroutine->ammarkpos = NULL;
+    amroutine->amrestrpos = NULL;
+    amroutine->amestimateparallelscan = NULL;
+    amroutine->aminitparallelscan = NULL;
+    amroutine->amparallelrescan = NULL;
+
+    PG_RETURN_POINTER(amroutine);
 }
 
 
@@ -64,7 +120,7 @@ STreeGetNewBuffer(Relation index)
         /*
          * The fixed pages shouldn't listed in FSM, we skip them.
          */
-        if (StreeBlockIsFixed(blkno))
+        if (STreeBlockIsFixed(blkno))
             continue;
 
         buffer = ReadBuffer(index, blkno);
@@ -89,6 +145,10 @@ STreeGetNewBuffer(Relation index)
         /* Can't use it, so release buffer and try again */
         ReleaseBuffer(buffer);
     }
+
+    /* No free page found - extend the relation */
+    buffer = ExtendBufferedRel(BMR_REL(index), MAIN_FORKNUM, NULL,
+                               EB_LOCK_FIRST);
     
     return buffer;
 }
@@ -99,7 +159,7 @@ void STreeInitMetapage(Page page) {
     /* Initialize the metapage */
     STreeInitPage(page, STREE_META);
 
-    metapage = StreePageGetMetaStart(page);
+    metapage = STreePageGetMetaStart(page);
     memset(metapage, 0, sizeof(STreeMetaPageData)); // zero out the metadata area (clean obtained from FSM or newly extended page)
     metapage->magicNumber = STREE_MAGIC_NUMBER;
     metapage->numberOfIndexedValues = 0;
@@ -119,6 +179,7 @@ void STreeInitMetapage(Page page) {
 void STreeInitPage(Page page, uint16 f) {
     // Initialize the Suffix Tree page
     STreeNodePageOpaque opaque;
+    STreeEdgeIdArrayHeader *edgeHeader;
 
     PageInit(page, BLCKSZ, sizeof(STreeNodePageOpaqueData));
     opaque = (STreeNodePageOpaque) PageGetSpecialPointer(page);
@@ -130,6 +191,20 @@ void STreeInitPage(Page page, uint16 f) {
     opaque->itemPointersStart = InvalidBlockNumber;
     opaque->firstNode = InvalidBlockNumber;
     opaque->suffixLink = InvalidBlockNumber;
+
+    /*
+     * For edge node pages (root and internal nodes), initialize the edge ID
+     * array header and update pd_lower to account for it.
+     */
+    if (f == STREE_ROOT || f == STREE_EDGE_NODE_PAGE)
+    {
+        edgeHeader = STreePageGetEdgeIdHeader(page);
+        edgeHeader->numberOfEdges = 0;
+        
+        /* Update pd_lower to point past the edge ID header */
+        ((PageHeader) page)->pd_lower = 
+            ((char *) edgeHeader + sizeof(STreeEdgeIdArrayHeader)) - (char *) page;
+    }
 }
 
 void initSTreeState(STreeState *state, Relation index) {
@@ -139,39 +214,50 @@ void initSTreeState(STreeState *state, Relation index) {
     state->redirectXid = GetTopTransactionIdIfAny();
 }
 
+/* ============================================================
+ * Unified Data Page Operations
+ * ============================================================
+ * These functions handle data pages for storing heap TIDs.
+ * They are generic and work for both:
+ *   - Node data pages (via opaque->itemPointersStart)
+ *   - Leaf edge data pages (via edge->destinationNode)
+ */
+
 /*
  * streeAllocateDataPage - Allocate a new data page for storing heap TIDs.
  *
- * This is called when a leaf edge has no data page yet.
+ * This is a generic function that allocates a data page and links it
+ * to the owner via the provided BlockNumber pointer.
  *
  * Parameters:
- *   index      - The relation
- *   leafBuffer - Buffer of the leaf node page (must be locked)
- *   edgeId     - The edge ID to update with the new data page
+ *   index           - The relation
+ *   ownerBuffer     - Buffer that will own this data page (for dirty marking)
+ *   dataPageBlknoPtr - Where to store the new block number (updated on success)
  *
  * Returns:
  *   Buffer of the new data page (locked), or InvalidBuffer on failure
  */
 Buffer
-streeAllocateDataPage(Relation index, Buffer leafBuffer, STreeEdgeIdData *edgeId)
+streeAllocateDataPage(Relation index, Buffer ownerBuffer, 
+                      BlockNumber *dataPageBlknoPtr)
 {
     Buffer                  dataBuffer;
     Page                    dataPage;
-    Page                    leafPage;
-    STreeEdgeInsideData    *edgeData;
     STreeNodePageOpaque     opaque;
     STreeNodeTupleDataEntries *header;
     BlockNumber             dataBlkno;
 
-    /* Allocate new page */
+    Assert(BufferIsValid(ownerBuffer));
+    Assert(dataPageBlknoPtr != NULL);
+
+    /* Allocate new page - STreeGetNewBuffer returns a locked buffer */
     dataBuffer = STreeGetNewBuffer(index);
     if (!BufferIsValid(dataBuffer))
         return InvalidBuffer;
 
     dataBlkno = BufferGetBlockNumber(dataBuffer);
-    LockBuffer(dataBuffer, BUFFER_LOCK_EXCLUSIVE);
+    /* Buffer is already exclusively locked by STreeGetNewBuffer */
     dataPage = BufferGetPage(dataBuffer);
-    leafPage = BufferGetPage(leafBuffer);
 
     START_CRIT_SECTION();
 
@@ -180,7 +266,7 @@ streeAllocateDataPage(Relation index, Buffer leafBuffer, STreeEdgeIdData *edgeId
 
     /* Set up opaque data */
     opaque = (STreeNodePageOpaque) PageGetSpecialPointer(dataPage);
-    opaque->parentNode = BufferGetBlockNumber(leafBuffer);
+    opaque->parentNode = BufferGetBlockNumber(ownerBuffer);
     opaque->prevSiblingNode = InvalidBlockNumber;
     opaque->nextSiblingNode = InvalidBlockNumber;
     opaque->itemPointersStart = InvalidBlockNumber;
@@ -193,12 +279,15 @@ streeAllocateDataPage(Relation index, Buffer leafBuffer, STreeEdgeIdData *edgeId
     header = (STreeNodeTupleDataEntries *) PageGetContents(dataPage);
     header->numberOfEntries = 0;
 
-    /* Update the leaf edge to point to this data page */
-    edgeData = streeGetEdgeData(leafPage, edgeId);
-    edgeData->destinationNode = dataBlkno;
+    /* Update pd_lower to account for the tuple entries header */
+    ((PageHeader) dataPage)->pd_lower = 
+        ((char *) header + STREE_NODE_TUPLE_DATA_ENTRIES_HEADER_SIZE) - (char *) dataPage;
+
+    /* Update the owner to point to this data page */
+    *dataPageBlknoPtr = dataBlkno;
 
     MarkBufferDirty(dataBuffer);
-    MarkBufferDirty(leafBuffer);
+    MarkBufferDirty(ownerBuffer);
 
     END_CRIT_SECTION();
 
@@ -206,22 +295,21 @@ streeAllocateDataPage(Relation index, Buffer leafBuffer, STreeEdgeIdData *edgeId
 }
 
 /*
- * streeAllocateOverflowDataPage - Allocate an overflow data page when current is full.
+ * streeAllocateOverflowDataPage - Allocate overflow page when current is full.
  *
- * Creates a chain of data pages for leaves with many TIDs.
+ * Creates a chain of data pages by linking the new page to the current one.
  *
  * Parameters:
  *   index         - The relation
- *   leafBuffer    - Buffer of the leaf node page
- *   edgeId        - The edge ID
+ *   ownerBuffer   - Buffer that owns the data page chain (for parentNode)
  *   currentBlkno  - Block number of the current (full) data page
  *
  * Returns:
  *   Buffer of the new overflow page (locked), or InvalidBuffer on failure
  */
 Buffer
-streeAllocateOverflowDataPage(Relation index, Buffer leafBuffer, 
-                               STreeEdgeIdData *edgeId, BlockNumber currentBlkno)
+streeAllocateOverflowDataPage(Relation index, Buffer ownerBuffer, 
+                              BlockNumber currentBlkno)
 {
     Buffer                  currentBuffer;
     Buffer                  newBuffer;
@@ -237,7 +325,7 @@ streeAllocateOverflowDataPage(Relation index, Buffer leafBuffer,
     LockBuffer(currentBuffer, BUFFER_LOCK_EXCLUSIVE);
     currentPage = BufferGetPage(currentBuffer);
 
-    /* Allocate new overflow page */
+    /* Allocate new overflow page - STreeGetNewBuffer returns a locked buffer */
     newBuffer = STreeGetNewBuffer(index);
     if (!BufferIsValid(newBuffer))
     {
@@ -246,7 +334,7 @@ streeAllocateOverflowDataPage(Relation index, Buffer leafBuffer,
     }
 
     newBlkno = BufferGetBlockNumber(newBuffer);
-    LockBuffer(newBuffer, BUFFER_LOCK_EXCLUSIVE);
+    /* Buffer is already exclusively locked by STreeGetNewBuffer */
     newPage = BufferGetPage(newBuffer);
 
     START_CRIT_SECTION();
@@ -256,7 +344,7 @@ streeAllocateOverflowDataPage(Relation index, Buffer leafBuffer,
 
     /* Set up opaque data for new page */
     newOpaque = (STreeNodePageOpaque) PageGetSpecialPointer(newPage);
-    newOpaque->parentNode = BufferGetBlockNumber(leafBuffer);
+    newOpaque->parentNode = BufferGetBlockNumber(ownerBuffer);
     newOpaque->prevSiblingNode = currentBlkno;
     newOpaque->nextSiblingNode = InvalidBlockNumber;
     newOpaque->itemPointersStart = InvalidBlockNumber;
@@ -268,6 +356,10 @@ streeAllocateOverflowDataPage(Relation index, Buffer leafBuffer,
     /* Initialize tuple entries header */
     header = (STreeNodeTupleDataEntries *) PageGetContents(newPage);
     header->numberOfEntries = 0;
+
+    /* Update pd_lower to account for the tuple entries header */
+    ((PageHeader) newPage)->pd_lower = 
+        ((char *) header + STREE_NODE_TUPLE_DATA_ENTRIES_HEADER_SIZE) - (char *) newPage;
 
     /* Update current page to point to new page */
     currentOpaque = (STreeNodePageOpaque) PageGetSpecialPointer(currentPage);
@@ -283,23 +375,193 @@ streeAllocateOverflowDataPage(Relation index, Buffer leafBuffer,
     return newBuffer;
 }
 
+/*
+ * streeAddHeapTidToDataPage - Add heap TID to a data page chain.
+ *
+ * This is the core function for adding TIDs. It handles:
+ * - Allocating the first data page if needed
+ * - Finding space in existing pages
+ * - Allocating overflow pages when full
+ *
+ * Parameters:
+ *   index            - The relation
+ *   dataPageBlknoPtr - Pointer to BlockNumber storing first data page
+ *                      (will be updated if new page allocated)
+ *   ownerBuffer      - Buffer that owns this data page link (for dirty marking)
+ *   tid              - The heap TID to store
+ *
+ * Returns:
+ *   true on success, false on failure
+ */
+bool
+streeAddHeapTidToDataPage(Relation index, BlockNumber *dataPageBlknoPtr,
+                          Buffer ownerBuffer, ItemPointer tid)
+{
+    BlockNumber             dataPageBlkno;
+    Buffer                  dataBuffer;
+    Page                    dataPage;
+    STreeNodeTupleDataEntries *header;
+    STreeNodeTuple          tuples;
+    Size                    spaceNeeded;
+    Size                    freeSpace;
+
+    Assert(BufferIsValid(ownerBuffer));
+    Assert(dataPageBlknoPtr != NULL);
+    Assert(tid != NULL);
+
+    dataPageBlkno = *dataPageBlknoPtr;
+
+    if (dataPageBlkno == InvalidBlockNumber)
+    {
+        /* Allocate new data page */
+        dataBuffer = streeAllocateDataPage(index, ownerBuffer, dataPageBlknoPtr);
+        if (!BufferIsValid(dataBuffer))
+            return false;
+    }
+    else
+    {
+        /* Read existing data page */
+        dataBuffer = ReadBuffer(index, dataPageBlkno);
+        LockBuffer(dataBuffer, BUFFER_LOCK_EXCLUSIVE);
+    }
+
+    dataPage = BufferGetPage(dataBuffer);
+    header = (STreeNodeTupleDataEntries *) PageGetContents(dataPage);
+
+    /* Calculate space needed */
+    spaceNeeded = MAXALIGN(sizeof(IndexTupleData));
+    freeSpace = PageGetFreeSpace(dataPage);
+
+    if (freeSpace < spaceNeeded)
+    {
+        /* Data page is full - chain to new overflow page */
+        BlockNumber currentBlkno = BufferGetBlockNumber(dataBuffer);
+        UnlockReleaseBuffer(dataBuffer);
+        
+        dataBuffer = streeAllocateOverflowDataPage(index, ownerBuffer, currentBlkno);
+        if (!BufferIsValid(dataBuffer))
+            return false;
+        
+        dataPage = BufferGetPage(dataBuffer);
+        header = (STreeNodeTupleDataEntries *) PageGetContents(dataPage);
+    }
+
+    START_CRIT_SECTION();
+
+    /* Get pointer to tuple array and add new entry */
+    tuples = (STreeNodeTuple) (((char *) header) + STREE_NODE_TUPLE_DATA_ENTRIES_HEADER_SIZE);
+    
+    /* Add new tuple at the end */
+    STreeNodeTuple newTuple = &tuples[header->numberOfEntries];
+    
+    /* Initialize the index tuple with the heap TID */
+    newTuple->t_tid = *tid;
+    newTuple->t_info = 0;
+
+    header->numberOfEntries++;
+
+    /* Update pd_lower to account for the new tuple */
+    ((PageHeader) dataPage)->pd_lower = 
+        ((char *) header + STREE_NODE_TUPLE_DATA_ENTRIES_HEADER_SIZE + 
+         (header->numberOfEntries * sizeof(STreeNodeTupleData))) - (char *) dataPage;
+
+    MarkBufferDirty(dataBuffer);
+
+    END_CRIT_SECTION();
+
+    UnlockReleaseBuffer(dataBuffer);
+
+    return true;
+}
 
 /*
- * PageGetFreeSpaceEnd - Get the offset where free space ends (before edge data).
+ * streeGetDataPageTids - Iterate over all TIDs stored in a data page chain.
  *
- * This assumes edge data grows downward from the special pointer area.
- * You may need to track this in your page header or calculate it.
+ * This is used during index scans to retrieve matching heap TIDs.
+ *
+ * Parameters:
+ *   index        - The relation
+ *   dataBlkno    - Block number of the first data page
+ *   callback     - Function to call for each TID
+ *   callbackArg  - Argument passed to callback
+ *
+ * Returns:
+ *   Number of TIDs processed
  */
-// static Offset
-// PageGetFreeSpaceEnd(Page page)
-// {
-//     STreeNodePageOpaque opaque;
+int
+streeGetDataPageTids(Relation index, BlockNumber dataBlkno,
+                     void (*callback)(ItemPointer tid, void *arg), void *callbackArg)
+{
+    int                     totalTids = 0;
+    BlockNumber             currentBlkno = dataBlkno;
+
+    while (currentBlkno != InvalidBlockNumber)
+    {
+        Buffer                  buffer;
+        Page                    page;
+        STreeNodePageOpaque     opaque;
+        STreeNodeTupleDataEntries *header;
+        STreeNodeTuple          tuples;
+        uint32                  i;
+
+        buffer = ReadBuffer(index, currentBlkno);
+        LockBuffer(buffer, BUFFER_LOCK_SHARE);
+        page = BufferGetPage(buffer);
+
+        header = (STreeNodeTupleDataEntries *) PageGetContents(page);
+        tuples = (STreeNodeTuple) (((char *) header) + STREE_NODE_TUPLE_DATA_ENTRIES_HEADER_SIZE);
+
+        /* Process each TID */
+        for (i = 0; i < header->numberOfEntries; i++)
+        {
+            if (callback)
+                callback(&tuples[i].t_tid, callbackArg);
+            totalTids++;
+        }
+
+        /* Move to next page in chain */
+        opaque = (STreeNodePageOpaque) PageGetSpecialPointer(page);
+        currentBlkno = opaque->nextSiblingNode;
+
+        UnlockReleaseBuffer(buffer);
+    }
+
+    return totalTids;
+}
+
+/*
+ * streevalidate - Validate an operator class for suffix tree
+ */
+bool
+streevalidate(Oid opclassoid)
+{
+    /* For now, accept any text operator class */
+    /* TODO: Add proper validation for LIKE operator support */
+    return true;
+}
+
+/*
+ * streecostestimate - Estimate the cost of an index scan
+ */
+void
+streecostestimate(PlannerInfo *root, IndexPath *path,
+                  double loop_count, Cost *indexStartupCost,
+                  Cost *indexTotalCost, Selectivity *indexSelectivity,
+                  double *indexCorrelation, double *indexPages)
+{
+    GenericCosts costs = {0};
     
-//     opaque = (STreeNodePageOpaque) PageGetSpecialPointer(page);
+    /* Use generic cost estimation as a starting point */
+    genericcostestimate(root, path, loop_count, &costs);
     
-//     /* 
-//      * If you track the lowest edge data offset in opaque or header,
-//      * return that. Otherwise, calculate based on existing edges.
-//      */
-//     return opaque->lowestEdgeDataOffset;
-// }
+    /*
+     * Suffix tree scans are typically O(m) where m is pattern length,
+     * plus O(k) where k is the number of matches. This is generally
+     * faster than sequential scan for substring searches.
+     */
+    *indexStartupCost = costs.indexStartupCost;
+    *indexTotalCost = costs.indexTotalCost;
+    *indexSelectivity = costs.indexSelectivity;
+    *indexCorrelation = costs.indexCorrelation;
+    *indexPages = costs.numIndexPages;
+}
