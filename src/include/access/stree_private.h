@@ -73,6 +73,18 @@ typedef STreeScanOpaqueData *STreeScanOpaque;
 //Index of the column that is going to be indexed
 #define streeIndexedColumn 0
 
+/*
+ * Terminator character for suffix tree strings.
+ * In classic suffix tree theory, each string must end with a unique terminator
+ * symbol that doesn't appear anywhere else in the alphabet. This ensures all
+ * suffixes end at explicit leaf nodes (not implicit positions within edges),
+ * making TID storage unambiguous.
+ * 
+ * We use '\0' (null byte) as the terminator since it cannot appear in valid
+ * PostgreSQL text strings.
+ */
+#define STREE_TERMINATOR_CHAR '\0'
+
 /* Page numbers of fixed-location pages */
 #define STREE_METAPAGE_BLK	  (0)	/* metapage */
 #define STREE_ROOT_BLK		  (1)	/* root for single byte entries */

@@ -104,6 +104,7 @@ bool streeinserttuple(Relation index, STreeBuildState *state,
     bool        result = true;
     Datum       valueToInsert;
     char       *strValue;
+    char       *strWithTerminator;  /* string with terminator appended */
     int         strByteLength;
     int         strCharLength;
     const char *strEnd;
@@ -125,13 +126,27 @@ bool streeinserttuple(Relation index, STreeBuildState *state,
     valueToInsert = PointerGetDatum(PG_DETOAST_DATUM(values[streeIndexedColumn]));
     strValue = VARDATA_ANY(valueToInsert);
     strByteLength = VARSIZE_ANY_EXHDR(valueToInsert);
-    strEnd = strValue + strByteLength;
 
     /* Get character length for UTF-8 strings */
     strCharLength = pg_mbstrlen_with_len(strValue, strByteLength);
 
     if (strCharLength <= 0)
         return true;
+
+    /*
+     * Allocate buffer for string + terminator character.
+     * The terminator ensures all suffixes end at explicit leaf nodes,
+     * making TID storage unambiguous.
+     */
+    strWithTerminator = palloc(strByteLength + 1);
+    memcpy(strWithTerminator, strValue, strByteLength);
+    strWithTerminator[strByteLength] = STREE_TERMINATOR_CHAR;
+    
+    /* Update pointers and lengths to include terminator */
+    strValue = strWithTerminator;
+    strByteLength = strByteLength + 1;  /* +1 for terminator */
+    strCharLength = strCharLength + 1;   /* terminator counts as one character */
+    strEnd = strValue + strByteLength;
 
     /* Initialize active point */
     activeNode.blockNumber = STREE_ROOT_BLK;
@@ -239,10 +254,45 @@ bool streeinserttuple(Relation index, STreeBuildState *state,
             if (edgeId == NULL)
             {
                 /*
-                 * RULE 2: No edge found - create new leaf edge.
+                 * RULE 2: No edge found - create new leaf edge with a leaf node.
+                 * 
+                 * We create a proper leaf NODE (not just an edge with InvalidBlockNumber)
+                 * so that we have a place to store TIDs for suffixes ending at this leaf.
+                 * This is essential for correct substring matching.
                  */
                 const char *labelStart = getByteOffsetForCharPos(strValue, strEnd, activeEdgeCharIdx);
                 int         labelBytes = strEnd - labelStart;
+
+                /* Create a leaf node for TID storage */
+                Buffer leafNodeBuffer = STreeGetNewBuffer(index);
+                if (!BufferIsValid(leafNodeBuffer))
+                {
+                    elog(WARNING, "Failed to allocate leaf node");
+                    result = false;
+                    goto cleanup;
+                }
+                
+                BlockNumber leafNodeBlkno = BufferGetBlockNumber(leafNodeBuffer);
+                Page leafNodePage = BufferGetPage(leafNodeBuffer);
+                
+                START_CRIT_SECTION();
+                
+                /* Initialize leaf node */
+                STreeInitPage(leafNodePage, STREE_EDGE_NODE_PAGE);
+                
+                MarkBufferDirty(leafNodeBuffer);
+                END_CRIT_SECTION();
+                
+                /* Store TID at the leaf node */
+                if (!streeAddHeapTidToNode(index, leafNodeBuffer, tid))
+                {
+                    UnlockReleaseBuffer(leafNodeBuffer);
+                    elog(WARNING, "Failed to add heap TID to leaf node");
+                    result = false;
+                    goto cleanup;
+                }
+                
+                UnlockReleaseBuffer(leafNodeBuffer);
 
                 START_CRIT_SECTION();
 
@@ -251,7 +301,7 @@ bool streeinserttuple(Relation index, STreeBuildState *state,
                     activeEdgeChar,
                     labelStart,
                     labelBytes,
-                    InvalidBlockNumber  /* Leaf - no child node yet */
+                    leafNodeBlkno  /* Point to the leaf node */
                 );
 
                 if (newEdge == NULL)
@@ -479,9 +529,39 @@ bool streeinserttuple(Relation index, STreeBuildState *state,
                         }
                     }
 
-                    /* Create leaf edge from new internal node */
+                    /* Create leaf edge from new internal node - with a proper leaf node */
                     const char *leafLabelStart = charStart;
                     int leafLabelBytes = strEnd - leafLabelStart;
+
+                    /* Create a leaf node for TID storage */
+                    Buffer splitLeafBuffer = STreeGetNewBuffer(index);
+                    if (!BufferIsValid(splitLeafBuffer))
+                    {
+                        UnlockReleaseBuffer(newInternalBuffer);
+                        elog(WARNING, "Failed to allocate leaf node after split");
+                        result = false;
+                        goto cleanup;
+                    }
+                    
+                    BlockNumber splitLeafBlkno = BufferGetBlockNumber(splitLeafBuffer);
+                    Page splitLeafPage = BufferGetPage(splitLeafBuffer);
+                    
+                    START_CRIT_SECTION();
+                    STreeInitPage(splitLeafPage, STREE_EDGE_NODE_PAGE);
+                    MarkBufferDirty(splitLeafBuffer);
+                    END_CRIT_SECTION();
+                    
+                    /* Store TID at the leaf node */
+                    if (!streeAddHeapTidToNode(index, splitLeafBuffer, tid))
+                    {
+                        UnlockReleaseBuffer(splitLeafBuffer);
+                        UnlockReleaseBuffer(newInternalBuffer);
+                        elog(WARNING, "Failed to add heap TID to split leaf node");
+                        result = false;
+                        goto cleanup;
+                    }
+                    
+                    UnlockReleaseBuffer(splitLeafBuffer);
 
                     START_CRIT_SECTION();
 
@@ -490,7 +570,7 @@ bool streeinserttuple(Relation index, STreeBuildState *state,
                         currentChar,
                         leafLabelStart,
                         leafLabelBytes,
-                        InvalidBlockNumber  /* Leaf */
+                        splitLeafBlkno  /* Point to the leaf node */
                     );
 
                     if (leafEdge == NULL)
@@ -554,6 +634,10 @@ bool streeinserttuple(Relation index, STreeBuildState *state,
         state->indexedTuples++;
 
 cleanup:
+    /* Free the allocated terminator string */
+    if (strWithTerminator != NULL)
+        pfree(strWithTerminator);
+
     if (BufferIsValid(lastNewInternalBuffer))
         UnlockReleaseBuffer(lastNewInternalBuffer);
 
