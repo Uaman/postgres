@@ -237,6 +237,9 @@ streeFindBufferForPattern(Relation index, const char *pattern, int patternBytes)
     const char  *pcur = pattern;
     const char  *pend = pattern + patternBytes;
 
+    elog(LOG, "streeFindBufferForPattern: searching for pattern '%.*s' (len=%d)",
+         patternBytes, pattern, patternBytes);
+
     /* Acquire root buffer */
     rootBuffer = ReadBuffer(index, STREE_ROOT_BLK);
     LockBuffer(rootBuffer, BUFFER_LOCK_SHARE);
@@ -245,6 +248,9 @@ streeFindBufferForPattern(Relation index, const char *pattern, int patternBytes)
     active.buffer = rootBuffer;
     active.page = BufferGetPage(rootBuffer);
 
+    elog(LOG, "streeFindBufferForPattern: root has %d edges", 
+         STreePageGetNumEdges(active.page));
+
     /* Walk the pattern character-by-character */
     while (pcur < pend)
     {
@@ -252,10 +258,14 @@ streeFindBufferForPattern(Relation index, const char *pattern, int patternBytes)
         const char *tmp = pcur;
         pg_wchar patChar = streeGetNextChar(&tmp, pend);
 
+        elog(LOG, "streeFindBufferForPattern: looking for edge with char %u at node %u",
+             patChar, active.blockNumber);
+
         /* Find edge starting with this character */
         STreeEdgeIdData *edgeId = lookupEdgeByFirstChar(active.page, patChar);
         if (edgeId == NULL)
         {
+            elog(LOG, "streeFindBufferForPattern: no edge found for char %u", patChar);
             /* No matching edge */
             UnlockReleaseBuffer(active.buffer);
             return InvalidBuffer;
@@ -263,6 +273,9 @@ streeFindBufferForPattern(Relation index, const char *pattern, int patternBytes)
 
         STreeEdgeInsideData *edgeData = streeGetEdgeData(active.page, edgeId);
         int edgeChars = getEdgeLabelCharLength(edgeData);
+
+        elog(LOG, "streeFindBufferForPattern: found edge '%.*s' (%d chars), dest=%u",
+             edgeData->labelLength, edgeData->label, edgeChars, edgeData->destinationNode);
 
         /* consume the first char we already peeked */
         pcur = tmp;
@@ -335,7 +348,76 @@ streeFindBufferForPattern(Relation index, const char *pattern, int patternBytes)
 
 
 /*
+ * streeCollectSubtreeTids - Recursively collect TIDs from a node and all its descendants.
+ *
+ * For substring search, when we find a node matching the pattern, we need to
+ * collect TIDs from the entire subtree rooted at that node, since all strings
+ * passing through any descendant also contain the pattern.
+ *
+ * Parameters:
+ *   index       - The relation
+ *   nodeBuffer  - Buffer for current node (must be locked for share)
+ *   callback    - Function to call for each TID
+ *   callbackArg - Argument passed to callback
+ *
+ * Returns:
+ *   Total number of TIDs collected from this subtree
+ */
+static int
+streeCollectSubtreeTids(Relation index, Buffer nodeBuffer,
+                        void (*callback)(ItemPointer tid, void *arg), 
+                        void *callbackArg)
+{
+    Page page = BufferGetPage(nodeBuffer);
+    BlockNumber nodeBlkno = BufferGetBlockNumber(nodeBuffer);
+    int total = 0;
+    int nodeTids = 0;
+    uint16 numEdges;
+    STreeEdgeIdData *edgeIds;
+
+    /* Collect TIDs stored directly at this node */
+    nodeTids = streeGetNodeTids(index, nodeBuffer, callback, callbackArg);
+    total += nodeTids;
+    
+    elog(LOG, "streeCollectSubtreeTids: node %u has %d direct TIDs", nodeBlkno, nodeTids);
+
+    /* Get edges from this node */
+    numEdges = STreePageGetNumEdges(page);
+    edgeIds = STreePageGetEdgeIds(page);
+    
+    elog(LOG, "streeCollectSubtreeTids: node %u has %d edges", nodeBlkno, numEdges);
+
+    /* Recurse into all child nodes */
+    for (uint16 i = 0; i < numEdges; i++)
+    {
+        STreeEdgeInsideData *edgeData = streeGetEdgeData(page, &edgeIds[i]);
+        BlockNumber childBlkno = edgeData->destinationNode;
+
+        if (childBlkno != InvalidBlockNumber)
+        {
+            /* Read child node */
+            Buffer childBuffer = ReadBuffer(index, childBlkno);
+            LockBuffer(childBuffer, BUFFER_LOCK_SHARE);
+
+            /* Recursively collect from child subtree */
+            total += streeCollectSubtreeTids(index, childBuffer, callback, callbackArg);
+
+            UnlockReleaseBuffer(childBuffer);
+        }
+    }
+
+    return total;
+}
+
+
+/*
  * streeFindAndCollect - Find pattern and collect TIDs via callback.
+ *
+ * This function finds the node representing the pattern in the suffix tree,
+ * then collects TIDs from the entire subtree rooted at that node. This is
+ * necessary for substring search because all strings in the subtree contain
+ * the pattern as a substring.
+ *
  * Returns number of TIDs processed.
  */
 int
@@ -348,8 +430,11 @@ streeFindAndCollect(Relation index, const char *pattern, int patternBytes,
     if (!BufferIsValid(nodeBuf))
         return 0;
 
-    /* Collect TIDs stored at this node */
-    total = streeGetNodeTids(index, nodeBuf, callback, callbackArg);
+    /* 
+     * Collect TIDs from entire subtree rooted at matching node.
+     * This ensures we find ALL strings containing the pattern.
+     */
+    total = streeCollectSubtreeTids(index, nodeBuf, callback, callbackArg);
 
     /* release node buffer */
     UnlockReleaseBuffer(nodeBuf);
@@ -363,19 +448,31 @@ streeFindAndCollect(Relation index, const char *pattern, int patternBytes,
  * ============================================================ */
 
 /*
- * Callback for collecting TIDs during search
+ * Callback for collecting TIDs during search.
+ * Performs deduplication to avoid returning the same TID multiple times.
  */
 static void
 streeCollectTidCallback(ItemPointer tid, void *arg)
 {
     STreeScanOpaque so = (STreeScanOpaque) arg;
     
+    /* Check for duplicates - TIDs might be stored at multiple nodes */
+    for (int i = 0; i < so->numTids; i++)
+    {
+        if (ItemPointerEquals(&so->tids[i], tid))
+            return;  /* Already have this TID */
+    }
+    
     /* Grow array if needed */
     if (so->numTids >= so->allocTids)
     {
-        so->allocTids = (so->allocTids == 0) ? 64 : so->allocTids * 2;
-        so->tids = (ItemPointerData *) repalloc(so->tids, 
-                                                 so->allocTids * sizeof(ItemPointerData));
+        int newSize = (so->allocTids == 0) ? 64 : so->allocTids * 2;
+        if (so->tids == NULL)
+            so->tids = (ItemPointerData *) palloc(newSize * sizeof(ItemPointerData));
+        else
+            so->tids = (ItemPointerData *) repalloc(so->tids, 
+                                                     newSize * sizeof(ItemPointerData));
+        so->allocTids = newSize;
     }
     
     /* Copy the TID */

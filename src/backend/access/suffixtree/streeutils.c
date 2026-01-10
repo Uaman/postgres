@@ -107,42 +107,52 @@ streehandler(PG_FUNCTION_ARGS)
 Buffer
 STreeGetNewBuffer(Relation index)
 {
-    Buffer		buffer;
+    Buffer      buffer;
+    int         fsmLoopCount = 0;
+    const int   maxFsmLoops = 10;  /* Limit FSM attempts */
 
     /* Try to get a page from FSM (Free Space Map) */
     for (;;)
     {
         BlockNumber blkno = GetFreeIndexPage(index);
 
+        fsmLoopCount++;
+        if (fsmLoopCount > maxFsmLoops)
+        {
+            /* Too many FSM attempts - just extend */
+            break;
+        }
+
         if (blkno == InvalidBlockNumber)
-            break;				/* nothing known to FSM */
+            break;  /* nothing known to FSM */
 
         /*
-         * The fixed pages shouldn't listed in FSM, we skip them.
+         * Skip fixed pages (metapage, root) - they shouldn't be in FSM
+         * but if they are, don't use them and break to extend.
          */
         if (STreeBlockIsFixed(blkno))
-            continue;
+            break;
 
         buffer = ReadBuffer(index, blkno);
 
         /*
-         * ConditionalLockBuffer tries to acquire an exclusive lock on the buffer without blocking and waiting.
-         * Avoiding possobolity that someone else already using this page; the buffer may be locked if so.
+         * ConditionalLockBuffer tries to acquire exclusive lock without blocking.
+         * If someone else is using this page, try another.
          */
         if (ConditionalLockBuffer(buffer))
         {
-            Page		page = BufferGetPage(buffer);
+            Page page = BufferGetPage(buffer);
 
-            if (PageIsNew(page))
+            if (PageIsNew(page) || PageIsEmpty(page))
+            {
+                /* Found a usable page */
                 return buffer;
-
-            if (PageIsEmpty(page))
-                return buffer;
+            }
 
             LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
         }
 
-        /* Can't use it, so release buffer and try again */
+        /* Can't use it, release and try again */
         ReleaseBuffer(buffer);
     }
 
@@ -247,15 +257,22 @@ streeAllocateDataPage(Relation index, Buffer ownerBuffer,
     STreeNodeTupleDataEntries *header;
     BlockNumber             dataBlkno;
 
+    elog(LOG, "streeAllocateDataPage: entering");
+
     Assert(BufferIsValid(ownerBuffer));
     Assert(dataPageBlknoPtr != NULL);
 
+    elog(LOG, "streeAllocateDataPage: calling STreeGetNewBuffer");
     /* Allocate new page - STreeGetNewBuffer returns a locked buffer */
     dataBuffer = STreeGetNewBuffer(index);
     if (!BufferIsValid(dataBuffer))
+    {
+        elog(LOG, "streeAllocateDataPage: STreeGetNewBuffer returned invalid");
         return InvalidBuffer;
+    }
 
     dataBlkno = BufferGetBlockNumber(dataBuffer);
+    elog(LOG, "streeAllocateDataPage: got new buffer blkno=%u", dataBlkno);
     /* Buffer is already exclusively locked by STreeGetNewBuffer */
     dataPage = BufferGetPage(dataBuffer);
 
@@ -405,21 +422,31 @@ streeAddHeapTidToDataPage(Relation index, BlockNumber *dataPageBlknoPtr,
     Size                    spaceNeeded;
     Size                    freeSpace;
 
+    elog(LOG, "streeAddHeapTidToDataPage: entering");
+
     Assert(BufferIsValid(ownerBuffer));
     Assert(dataPageBlknoPtr != NULL);
     Assert(tid != NULL);
 
     dataPageBlkno = *dataPageBlknoPtr;
 
+    elog(LOG, "streeAddHeapTidToDataPage: dataPageBlkno=%u", dataPageBlkno);
+
     if (dataPageBlkno == InvalidBlockNumber)
     {
+        elog(LOG, "streeAddHeapTidToDataPage: allocating new data page");
         /* Allocate new data page */
         dataBuffer = streeAllocateDataPage(index, ownerBuffer, dataPageBlknoPtr);
         if (!BufferIsValid(dataBuffer))
+        {
+            elog(LOG, "streeAddHeapTidToDataPage: allocation failed");
             return false;
+        }
+        elog(LOG, "streeAddHeapTidToDataPage: allocated data page %u", *dataPageBlknoPtr);
     }
     else
     {
+        elog(LOG, "streeAddHeapTidToDataPage: reading existing data page");
         /* Read existing data page */
         dataBuffer = ReadBuffer(index, dataPageBlkno);
         LockBuffer(dataBuffer, BUFFER_LOCK_EXCLUSIVE);
@@ -508,6 +535,17 @@ streeGetDataPageTids(Relation index, BlockNumber dataBlkno,
         LockBuffer(buffer, BUFFER_LOCK_SHARE);
         page = BufferGetPage(buffer);
 
+        /* Validate page */
+        opaque = (STreeNodePageOpaque) PageGetSpecialPointer(page);
+
+        if (opaque->streePageId != STREE_PAGE_ID)
+        {
+            elog(WARNING, "streeGetDataPageTids: invalid streePageId=%u (expected %u)",
+                 opaque->streePageId, STREE_PAGE_ID);
+            UnlockReleaseBuffer(buffer);
+            return totalTids;
+        }
+
         header = (STreeNodeTupleDataEntries *) PageGetContents(page);
         tuples = (STreeNodeTuple) (((char *) header) + STREE_NODE_TUPLE_DATA_ENTRIES_HEADER_SIZE);
 
@@ -520,7 +558,6 @@ streeGetDataPageTids(Relation index, BlockNumber dataBlkno,
         }
 
         /* Move to next page in chain */
-        opaque = (STreeNodePageOpaque) PageGetSpecialPointer(page);
         currentBlkno = opaque->nextSiblingNode;
 
         UnlockReleaseBuffer(buffer);

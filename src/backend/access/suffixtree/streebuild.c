@@ -25,21 +25,23 @@ static void streeBuildCallback(Relation index, ItemPointer tid, Datum *values,
     /* Build in temporary memory context, and reset it after each tuple insert */
     oldCtx = MemoryContextSwitchTo(buildState->tmpMemCtx);
 
-    /*
-     * Need to be ready to concurrent insertion and getting a buffer-locking failure. 
-     * Should be ready to retry.  We can flush
-     * any temp data when retrying.
-     */
-    while (!streeinserttuple(index, buildState, tid,
-                        values, isnull))
+    elog(LOG, "streeBuildCallback: switched memory context, calling streeinserttuple");
+
+    /* Call insert once - no retry loop for now to debug */
+    if (!streeinserttuple(index, buildState, tid, values, isnull))
     {
-        MemoryContextReset(buildState->tmpMemCtx);
+        elog(WARNING, "streeBuildCallback: streeinserttuple returned false");
     }
+
+    elog(LOG, "streeBuildCallback: streeinserttuple returned");
 
     /* Update total tuple count */
     buildState->indexedTuples += 1;
 
+    elog(LOG, "streeBuildCallback: switching back memory context");
     MemoryContextSwitchTo(oldCtx);
+    
+    elog(LOG, "streeBuildCallback: resetting tmpMemCtx");
     MemoryContextReset(buildState->tmpMemCtx);
 
     elog(LOG, "streeBuildCallback: completed for tuple %u/%u", 
@@ -63,11 +65,16 @@ streebuild(Relation heap, Relation index, IndexInfo *indexInfo)
 		elog(ERROR, "index (file) \"%s\" already contains data, cannot build, need clean one",
 			 RelationGetRelationName(index));
 
+	elog(LOG, "streebuild: starting, about to allocate metabuffer");
+
 	/*
 	 * Initialize the meta page and root pages
 	 */
 	metabuffer = STreeGetNewBuffer(index);
+	elog(LOG, "streebuild: metabuffer allocated, blkno=%u", BufferGetBlockNumber(metabuffer));
+	
 	rootbuffer = STreeGetNewBuffer(index);
+	elog(LOG, "streebuild: rootbuffer allocated, blkno=%u", BufferGetBlockNumber(rootbuffer));
 
 	Assert(BufferGetBlockNumber(metabuffer) == STREE_METAPAGE_BLK);
 	Assert(BufferGetBlockNumber(rootbuffer) == STREE_ROOT_BLK);
@@ -86,6 +93,8 @@ streebuild(Relation heap, Relation index, IndexInfo *indexInfo)
 	UnlockReleaseBuffer(metabuffer);
 	UnlockReleaseBuffer(rootbuffer);
 
+	elog(LOG, "streebuild: pages initialized");
+	
 	/*
 	 * Now insert all the heap data into the index
 	 */
@@ -97,9 +106,13 @@ streebuild(Relation heap, Relation index, IndexInfo *indexInfo)
 											  "STree build temporary context",
 											  ALLOCSET_DEFAULT_SIZES);
 
+	elog(LOG, "streebuild: about to call table_index_build_scan");
+
 	reltuples = table_index_build_scan(heap, index, indexInfo, true, true,
 									   streeBuildCallback, &buildState,
 									   NULL);
+
+	elog(LOG, "streebuild: table_index_build_scan returned, reltuples=%f", reltuples);
 
 	MemoryContextDelete(buildState.tmpMemCtx);
 

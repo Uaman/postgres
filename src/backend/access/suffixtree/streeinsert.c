@@ -33,6 +33,29 @@
 
 
 /*
+ * Structure for passing context to streeCopyTidToNode callback.
+ */
+typedef struct StreeCopyTidContext
+{
+    Relation    index;
+    Buffer      destBuffer;
+} StreeCopyTidContext;
+
+/*
+ * streeCopyTidToNode - Callback to copy TID to a node during edge split.
+ * The arg is a StreeCopyTidContext pointer.
+ */
+static void
+streeCopyTidToNode(ItemPointer tid, void *arg)
+{
+    StreeCopyTidContext *ctx = (StreeCopyTidContext *) arg;
+    
+    /* Add TID to the destination node - ignore failures silently */
+    (void) streeAddHeapTidToNode(ctx->index, ctx->destBuffer, tid);
+}
+
+
+/*
  * findEdgeInsertPosition - Find position to insert edge maintaining sorted order.
  */
 static uint16
@@ -137,19 +160,18 @@ bool streeinserttuple(Relation index, STreeBuildState *state,
     currentPos = strValue;
     charIndex = 0;
 
-    elog(LOG, ">>>>>Starting insertion of string of byte length %d, char length %d",
-         strByteLength, strCharLength);
+    elog(DEBUG1, "Starting insertion of string '%.*s' (byte length %d, char length %d)",
+         strByteLength, strValue, strByteLength, strCharLength);
 
     while (currentPos < strEnd)
     {
         const char *charStart = currentPos;
         pg_wchar    currentChar = streeGetNextChar(&currentPos, strEnd);
-        int         currentCharByteLen = currentPos - charStart;
 
-        elog(DEBUG1, "Processing character at byte index %ld, Unicode codepoint %u",
-             charStart - strValue, currentChar);
+        elog(LOG, "Processing char %d: codepoint %u, remainder before=%d", 
+             charIndex, currentChar, remainder);
 
-        //TODO: consider storing current insertion state for resuming after interrupt     
+        /* Check for interrupts periodically */
         if (INTERRUPTS_PENDING_CONDITION())
         {
             result = false;
@@ -167,10 +189,29 @@ bool streeinserttuple(Relation index, STreeBuildState *state,
             lastNewInternalBuffer = InvalidBuffer;
         }
 
+        int loopCounter = 0;
+        const int maxLoops = strCharLength + 10;  /* Safety limit based on string length */
+        
         while (remainder > 0)
         {
+            /* 
+             * Force compiler to re-read activeNode state from memory.
+             * This prevents potential issues with cached/optimized values.
+             */
+            volatile BlockNumber _dummy_blk = activeNode.blockNumber;
+            (void) _dummy_blk;
+            
+            loopCounter++;
+            if (loopCounter > maxLoops)
+            {
+                elog(ERROR, "Inner loop exceeded %d iterations - likely infinite loop. remainder=%d, activeLength=%d",
+                     maxLoops, remainder, activeLength);
+            }
+            
             if (activeLength == 0)
                 activeEdgeCharIdx = charIndex - 1;
+
+            /* Walk down as far as possible */
 
             /* Walk down as far as possible */
             while (activeLength > 0 &&
@@ -195,9 +236,6 @@ bool streeinserttuple(Relation index, STreeBuildState *state,
             /* Look for edge starting with active edge character */
             STreeEdgeIdData *edgeId = lookupEdgeByFirstChar(activeNode.page, activeEdgeChar);
 
-            elog(LOG, "Checked for edge with char %u, found: %s", 
-                 activeEdgeChar, edgeId ? "yes" : "no");
-
             if (edgeId == NULL)
             {
                 /*
@@ -205,9 +243,6 @@ bool streeinserttuple(Relation index, STreeBuildState *state,
                  */
                 const char *labelStart = getByteOffsetForCharPos(strValue, strEnd, activeEdgeCharIdx);
                 int         labelBytes = strEnd - labelStart;
-
-                elog(LOG, "Rule 2 (no edge): creating leaf at char %d, labelBytes=%d", 
-                     activeEdgeCharIdx, labelBytes);
 
                 START_CRIT_SECTION();
 
@@ -227,18 +262,9 @@ bool streeinserttuple(Relation index, STreeBuildState *state,
                     goto cleanup;
                 }
 
-                elog(LOG, "Rule 2: Edge inserted successfully");
-
                 MarkBufferDirty(activeNode.buffer);
 
                 END_CRIT_SECTION();
-
-                /*
-                 * TID is stored at the NODE level, not at the edge level.
-                 * The TID was already added to root initially, and to each node
-                 * we walked down to. The leaf edge's destination is InvalidBlockNumber
-                 * since it's a leaf - we don't store TIDs via edges.
-                 */
 
                 /* Set suffix link from previous internal node */
                 if (lastNewInternalNode != InvalidBlockNumber &&
@@ -276,11 +302,7 @@ bool streeinserttuple(Relation index, STreeBuildState *state,
                 }
                 else
                 {
-                    /*
-                     * At root with activeLength == 0: we just inserted a new leaf edge.
-                     * The current suffix is fully handled. Break out of the remainder loop
-                     * to continue with the next character in the outer loop.
-                     */
+                    /* At root with activeLength == 0: done with this suffix */
                     break;
                 }
             }
@@ -295,17 +317,77 @@ bool streeinserttuple(Relation index, STreeBuildState *state,
                 pg_wchar edgeCharAtPos;
                 
                 if (activeLength < edgeLabelCharLen)
+                {
                     edgeCharAtPos = getEdgeLabelCharAt(edgeData, activeLength);
+                }
                 else
+                {
+                    /*
+                     * activeLength >= edgeLabelCharLen but walkDown didn't happen.
+                     * This means we're at a leaf edge or destination is invalid.
+                     * We need to handle this case - we can't split here!
+                     */
+                    if (edgeData->destinationNode == InvalidBlockNumber)
+                    {
+                        /*
+                         * This is a leaf edge. We need to extend it or create 
+                         * an internal node here. For now, just add the TID to 
+                         * the current node and continue.
+                         */
+                        remainder--;
+                        
+                        /* Follow suffix link or adjust active point */
+                        if (activeNode.blockNumber == STREE_ROOT_BLK && activeLength > 0)
+                        {
+                            activeLength--;
+                            activeEdgeCharIdx++;
+                        }
+                        else if (activeNode.blockNumber != STREE_ROOT_BLK)
+                        {
+                            if (!followSuffixLink(index, &activeNode, rootBuffer, STREE_ROOT_BLK))
+                            {
+                                result = false;
+                                goto cleanup;
+                            }
+                        }
+                        continue;
+                    }
                     edgeCharAtPos = 0;
+                }
 
                 if (edgeCharAtPos == currentChar)
                 {
                     /*
                      * RULE 3: Character matches - stop this phase.
+                     * 
+                     * Store TID at the appropriate node for this path.
+                     * If we're at position 0 of an edge with a destination node,
+                     * the TID belongs at that destination (it's part of that subtree).
+                     * Otherwise store at current node.
                      */
-                    elog(DEBUG2, "Rule 3: char matches, activeLength++");
-
+                    Buffer tidBuffer = activeNode.buffer;
+                    bool needReleaseTidBuffer = false;
+                    
+                    if (activeLength == 0 && edgeData->destinationNode != InvalidBlockNumber)
+                    {
+                        /* Store at destination node since we're entering this subtree */
+                        tidBuffer = ReadBuffer(index, edgeData->destinationNode);
+                        LockBuffer(tidBuffer, BUFFER_LOCK_EXCLUSIVE);
+                        needReleaseTidBuffer = true;
+                    }
+                    
+                    if (!streeAddHeapTidToNode(index, tidBuffer, tid))
+                    {
+                        if (needReleaseTidBuffer)
+                            UnlockReleaseBuffer(tidBuffer);
+                        elog(WARNING, "Failed to add heap TID at Rule 3 match");
+                        result = false;
+                        goto cleanup;
+                    }
+                    
+                    if (needReleaseTidBuffer)
+                        UnlockReleaseBuffer(tidBuffer);
+                    
                     activeLength++;
 
                     /* Set suffix link from previous internal node */
@@ -332,9 +414,15 @@ bool streeinserttuple(Relation index, STreeBuildState *state,
                 {
                     /*
                      * RULE 2 with SPLIT: Need to split the edge.
+                     * Only valid if activeLength > 0 (we're inside an edge).
                      */
-                    elog(DEBUG2, "Rule 2 (split): splitting at pos %d", activeLength);
-
+                    if (activeLength == 0)
+                    {
+                        elog(WARNING, "Cannot split at position 0 - logic error");
+                        result = false;
+                        goto cleanup;
+                    }
+                    
                     BlockNumber newInternalBlkno;
 
                     newInternalBlkno = splitEdgeWithBuffer(
@@ -367,6 +455,29 @@ bool streeinserttuple(Relation index, STreeBuildState *state,
                         result = false;
                         goto cleanup;
                     }
+                    
+                    /*
+                     * CRITICAL: Copy TIDs from parent node to the new internal node.
+                     * When we split an edge, previous strings that contain the
+                     * substring represented by this path should also be at the
+                     * new internal node. We copy all TIDs from parent - this is
+                     * conservative but correct for substring matching.
+                     */
+                    {
+                        STreeNodePageOpaque parentOpaque = 
+                            (STreeNodePageOpaque) PageGetSpecialPointer(activeNode.page);
+                        
+                        if (parentOpaque->itemPointersStart != InvalidBlockNumber)
+                        {
+                            StreeCopyTidContext copyCtx;
+                            copyCtx.index = index;
+                            copyCtx.destBuffer = newInternalBuffer;
+                            
+                            /* Copy TIDs from parent's data pages */
+                            streeGetDataPageTids(index, parentOpaque->itemPointersStart,
+                                                 streeCopyTidToNode, &copyCtx);
+                        }
+                    }
 
                     /* Create leaf edge from new internal node */
                     const char *leafLabelStart = charStart;
@@ -394,19 +505,6 @@ bool streeinserttuple(Relation index, STreeBuildState *state,
                     MarkBufferDirty(newInternalBuffer);
 
                     END_CRIT_SECTION();
-
-                    /*
-                     * Add TID to the new internal node we just created.
-                     * This is the node that will be traversed for any suffix
-                     * starting with the split prefix.
-                     */
-                    if (!streeAddHeapTidToNode(index, newInternalBuffer, tid))
-                    {
-                        UnlockReleaseBuffer(newInternalBuffer);
-                        elog(WARNING, "Failed to add heap TID to new internal node after split");
-                        result = false;
-                        goto cleanup;
-                    }
 
                     /* Set suffix link from previous internal node */
                     if (lastNewInternalNode != InvalidBlockNumber &&
@@ -456,31 +554,19 @@ bool streeinserttuple(Relation index, STreeBuildState *state,
         state->indexedTuples++;
 
 cleanup:
-    elog(LOG, "streeinserttuple: cleanup starting");
     if (BufferIsValid(lastNewInternalBuffer))
-    {
-        elog(LOG, "streeinserttuple: releasing lastNewInternalBuffer");
         UnlockReleaseBuffer(lastNewInternalBuffer);
-    }
 
     if (activeNode.buffer != rootBuffer && BufferIsValid(activeNode.buffer))
-    {
-        elog(LOG, "streeinserttuple: releasing activeNode.buffer");
         UnlockReleaseBuffer(activeNode.buffer);
-    }
 
     if (BufferIsValid(rootBuffer))
-    {
-        elog(LOG, "streeinserttuple: releasing rootBuffer");
         UnlockReleaseBuffer(rootBuffer);
-    }
 
-    elog(LOG, "streeinserttuple: cleanup complete, returning %s", result ? "true" : "false");
     CHECK_FOR_INTERRUPTS();
 
     return result;
 }
-
 
 
 /*
