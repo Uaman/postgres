@@ -173,7 +173,13 @@ select amname, prop, pg_indexam_has_property(a.oid, prop) as p
  spgist | can_exclude   | t
  spgist | can_include   | t
  spgist | bogus         | 
-(36 rows)
+ stree  | can_order     | f
+ stree  | can_unique    | f
+ stree  | can_multi_col | f
+ stree  | can_exclude   | t
+ stree  | can_include   | f
+ stree  | bogus         | 
+(42 rows)
 
 --
 -- additional checks for pg_index_column_has_property

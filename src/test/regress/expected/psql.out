@@ -5137,7 +5137,8 @@ List of access methods
  heap   | Table
  heap2  | Table
  spgist | Index
-(8 rows)
+ stree  | Index
+(9 rows)
 
 \dA *
 List of access methods
@@ -5151,7 +5152,8 @@ List of access methods
  heap   | Table
  heap2  | Table
  spgist | Index
-(8 rows)
+ stree  | Index
+(9 rows)
 
 \dA h*
 List of access methods
@@ -5187,7 +5189,8 @@ List of access methods
  heap   | Table | heap_tableam_handler | heap table access method
  heap2  | Table | heap_tableam_handler | 
  spgist | Index | spghandler           | SP-GiST index access method
-(8 rows)
+ stree  | Index | streehandler         | suffix tree index access method
+(9 rows)
 
 \dA+ *
                              List of access methods
@@ -5201,7 +5204,8 @@ List of access methods
  heap   | Table | heap_tableam_handler | heap table access method
  heap2  | Table | heap_tableam_handler | 
  spgist | Index | spghandler           | SP-GiST index access method
-(8 rows)
+ stree  | Index | streehandler         | suffix tree index access method
+(9 rows)
 
 \dA+ h*
                      List of access methods
