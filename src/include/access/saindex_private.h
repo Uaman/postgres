@@ -556,20 +556,51 @@ typedef struct SABuildState
  * ----------------------------------------------------------------
  */
 
+/* Reloption registration (call once before saoptions/sahandler) */
+extern void sa_register_reloptions(void);
+
 /* Reloptions */
 extern bytea *saoptions(Datum reloptions, bool validate);
 
 /* State initialization */
 extern void initSAState(SAState *state, Relation index);
+extern void SAReadMeta(Relation index, SAMetaPageData *metaOut);
 
 /* Page initialization */
 extern void SAInitPage(Page page, uint16 flags, Size pageSize);
 extern void SAInitMetaPage(Page page, SAMetaPageData *meta, Size pageSize);
+extern void SAInitEmptyMeta(SAMetaPageData *meta, int maxPrefixLen);
 
-/* Entry comparison (byte-wise, for sorting and binary search) */
+/*
+ * Comparison functions.
+ *
+ * All SA comparisons use byte-wise (memcmp) ordering, not collation-aware.
+ * This is deliberate: substring search is a byte-level operation, and
+ * memcmp-sorted suffix arrays guarantee prefix-contiguous ranges.
+ *
+ * sa_compare_suffixes: compare two full-length suffix texts, used during
+ *     build sort.  Shorter suffix sorts first on tie.
+ *
+ * sa_compare_prefix: compare a search pattern against a stored sa_key,
+ *     used during binary search.  Compares min(patternLen, maxPrefixLen)
+ *     bytes.  Returns 0 if the entry's prefix matches the pattern.
+ *
+ * sa_compare_keys: general comparison with prefix truncation, matches
+ *     the stored SA ordering.
+ *
+ * sa_compute_lcp: longest common prefix of two byte sequences, bounded
+ *     by max_prefix_len.  Used during build to populate SAEntry.sa_lcp.
+ */
+extern int	sa_compare_suffixes(const char *a, int alen,
+								const char *b, int blen);
+extern int	sa_compare_prefix(const char *entry_key, int max_prefix_len,
+							  const char *pattern, int pattern_len);
 extern int	sa_compare_keys(const char *a, int alen,
 							const char *b, int blen,
 							int max_prefix_len);
+extern int	sa_compute_lcp(const char *a, int alen,
+						   const char *b, int blen,
+						   int max_prefix_len);
 
 /* Build phase name for progress reporting */
 extern char *sabuildphasename(int64 phasenum);
