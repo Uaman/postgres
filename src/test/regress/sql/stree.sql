@@ -347,3 +347,92 @@ RESET enable_indexscan;
 
 -- Cleanup
 DROP TABLE stree_perf;
+
+--
+-- Test 12: Mississippi string tests (classic suffix tree test case)
+--
+SELECT '=== Test 12: Mississippi tests ===' as test;
+
+CREATE TABLE stree_mississippi (
+    id serial PRIMARY KEY,
+    t text
+);
+
+-- Insert mississippi and related strings
+INSERT INTO stree_mississippi (t) VALUES
+    ('mississippi'),
+    ('missouri'),
+    ('miss'),
+    ('ippi'),
+    ('issi'),
+    ('ssissippi'),
+    ('ab'),
+    ('ba'),
+    ('hello'),
+    ('world');
+
+CREATE INDEX stree_mississippi_idx ON stree_mississippi USING stree (t);
+
+SET enable_seqscan = OFF;
+SET enable_indexscan = ON;
+
+-- Test various substrings of mississippi
+SELECT '%issi%' as pattern, array_agg(t ORDER BY id) as result 
+FROM stree_mississippi WHERE t LIKE '%issi%';
+
+SELECT '%ssi%' as pattern, array_agg(t ORDER BY id) as result 
+FROM stree_mississippi WHERE t LIKE '%ssi%';
+
+SELECT '%iss%' as pattern, array_agg(t ORDER BY id) as result 
+FROM stree_mississippi WHERE t LIKE '%iss%';
+
+SELECT '%ss%' as pattern, array_agg(t ORDER BY id) as result 
+FROM stree_mississippi WHERE t LIKE '%ss%';
+
+SELECT '%pp%' as pattern, array_agg(t ORDER BY id) as result 
+FROM stree_mississippi WHERE t LIKE '%pp%';
+
+SELECT '%pi%' as pattern, array_agg(t ORDER BY id) as result 
+FROM stree_mississippi WHERE t LIKE '%pi%';
+
+SELECT '%i%' as pattern, array_agg(t ORDER BY id) as result 
+FROM stree_mississippi WHERE t LIKE '%i%';
+
+SELECT '%s%' as pattern, array_agg(t ORDER BY id) as result 
+FROM stree_mississippi WHERE t LIKE '%s%';
+
+SELECT '%miss%' as pattern, array_agg(t ORDER BY id) as result 
+FROM stree_mississippi WHERE t LIKE '%miss%';
+
+-- Test strings that share characters in both directions (edge case)
+SELECT '%ab%' as pattern, array_agg(t ORDER BY id) as result 
+FROM stree_mississippi WHERE t LIKE '%ab%';
+
+SELECT '%ba%' as pattern, array_agg(t ORDER BY id) as result 
+FROM stree_mississippi WHERE t LIKE '%ba%';
+
+-- Test lo/ol pattern (shared chars both directions)
+SELECT '%lo%' as pattern, array_agg(t ORDER BY id) as result 
+FROM stree_mississippi WHERE t LIKE '%lo%';
+
+SELECT '%or%' as pattern, array_agg(t ORDER BY id) as result 
+FROM stree_mississippi WHERE t LIKE '%or%';
+
+-- Verify with sequential scan
+SET enable_seqscan = ON;
+SET enable_indexscan = OFF;
+
+SELECT '%issi%' as pattern, array_agg(t ORDER BY id) as seqscan_result 
+FROM stree_mississippi WHERE t LIKE '%issi%';
+
+SELECT '%ab%' as pattern, array_agg(t ORDER BY id) as seqscan_result 
+FROM stree_mississippi WHERE t LIKE '%ab%';
+
+SELECT '%ba%' as pattern, array_agg(t ORDER BY id) as seqscan_result 
+FROM stree_mississippi WHERE t LIKE '%ba%';
+
+RESET enable_seqscan;
+RESET enable_indexscan;
+
+-- Cleanup
+DROP TABLE stree_mississippi;
