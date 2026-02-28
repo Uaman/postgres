@@ -488,4 +488,8 @@
 
 # no brin opclass for the geometric types except box
 
+
+# suffix array index
+{ opcmethod => 'saindex', opcname => 'text_sa_ops',
+  opcfamily => 'saindex/text_sa_ops', opcintype => 'text' },
 ]

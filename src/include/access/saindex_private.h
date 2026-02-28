@@ -40,7 +40,6 @@
 #include "fmgr.h"
 #include "nodes/tidbitmap.h"
 #include "storage/bufmgr.h"
-#include "utils/tuplesort.h"
 
 
 /* ----------------------------------------------------------------
@@ -535,19 +534,49 @@ typedef SAScanOpaqueData *SAScanOpaque;
  * ----------------------------------------------------------------
  */
 
+/*
+ * SASortItem -- in-memory representation of one suffix during build.
+ *
+ * The 'suffix' pointer points into a long-lived copy of the original
+ * heap text value (kept in SABuildState.textCtx).  All suffixes of
+ * one value share the same underlying allocation.
+ */
+typedef struct SASortItem
+{
+	const char	   *suffix;			/* pointer to suffix start within value copy */
+	int				suffixlen;		/* length of suffix (value_len - offset) */
+	ItemPointerData	heaptid;		/* heap row identifier */
+	int32			offset;			/* byte offset of suffix start in value */
+} SASortItem;
+
+/*
+ * SABuildState -- mutable state for sabuild().
+ *
+ * The build callback accumulates SASortItems in a dynamically-grown
+ * array, then sabuild() qsorts them and writes the sorted result
+ * to index pages.
+ *
+ * TODO: for very large tables, switch to tuplesort-based external sort
+ * to avoid exhausting memory.  For now, all suffix entries and their
+ * text data must fit in RAM.
+ */
 typedef struct SABuildState
 {
-	SAState		sastate;
+	/* Index parameters */
+	int32		maxPrefixLen;		/* from reloptions */
+	int32		entrySize;			/* SA_ENTRY_SIZE(maxPrefixLen) */
+	int32		entriesPerPage;		/* entries per SA leaf page */
 
-	/* Sort accumulator for all suffix entries */
-	Tuplesortstate *sortstate;
+	/* Dynamic array of sort entries */
+	SASortItem *items;
+	int64		numEntries;			/* entries accumulated so far */
+	int64		maxEntries;			/* allocated capacity of items[] */
 
 	/* Counters */
-	int64		numEntries;			/* total suffix entries generated */
 	int64		numHeapTuples;		/* heap rows processed */
 
 	/* Memory management */
-	MemoryContext tmpCtx;			/* reset per heap tuple */
+	MemoryContext textCtx;			/* stores copies of heap text values */
 } SABuildState;
 
 
@@ -640,11 +669,31 @@ extern bool sa_binary_search(Relation index, SAMetaPageData *meta,
 
 
 /* ----------------------------------------------------------------
- *				AM handler
+ *				Function declarations -- sahandler.c
  * ----------------------------------------------------------------
  */
 
-extern IndexAmRoutine *sahandler(PG_FUNCTION_ARGS);
+extern Datum sahandler(PG_FUNCTION_ARGS);
+extern bool savalidate(Oid opclassoid);
+extern void sacostestimate(struct PlannerInfo *root,
+						   struct IndexPath *path,
+						   double loop_count,
+						   Cost *indexStartupCost,
+						   Cost *indexTotalCost,
+						   Selectivity *indexSelectivity,
+						   double *indexCorrelation,
+						   double *indexPages);
+
+
+/* ----------------------------------------------------------------
+ *				Function declarations -- saoperators.c
+ * ----------------------------------------------------------------
+ */
+
+extern Datum sa_text_contains(PG_FUNCTION_ARGS);
+extern Datum sa_text_prefix(PG_FUNCTION_ARGS);
+extern Datum sa_text_suffix(PG_FUNCTION_ARGS);
+extern Datum sa_text_cmp(PG_FUNCTION_ARGS);
 
 
 #endif							/* SAINDEX_PRIVATE_H */

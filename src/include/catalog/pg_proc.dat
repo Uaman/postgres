@@ -12493,4 +12493,18 @@
   proargtypes => 'int4',
   prosrc => 'gist_stratnum_common' },
 
+
+# suffix array index access method
+{ oid => '9500', descr => 'suffix array index access method handler',
+  proname => 'sahandler', provolatile => 'v', prorettype => 'index_am_handler',
+  proargtypes => 'internal', prosrc => 'sahandler' },
+{ oid => '9501', descr => 'text contains substring (byte-wise)',
+  proname => 'sa_text_contains', prorettype => 'bool',
+  proargtypes => 'text text', prosrc => 'sa_text_contains' },
+{ oid => '9502', descr => 'text ends with suffix (byte-wise)',
+  proname => 'sa_text_suffix', prorettype => 'bool',
+  proargtypes => 'text text', prosrc => 'sa_text_suffix' },
+{ oid => '9503', descr => 'byte-wise text comparison for SA index',
+  proname => 'sa_text_cmp', prorettype => 'int4',
+  proargtypes => 'text text', prosrc => 'sa_text_cmp' },
 ]

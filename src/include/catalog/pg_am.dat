@@ -34,4 +34,7 @@
   descr => 'block range index (BRIN) access method',
   amname => 'brin', amhandler => 'brinhandler', amtype => 'i' },
 
+{ oid => '9510', oid_symbol => 'SAINDEX_AM_OID',
+  descr => 'suffix array index access method',
+  amname => 'saindex', amhandler => 'sahandler', amtype => 'i' },
 ]

@@ -3227,4 +3227,15 @@
   amoprighttype => 'point', amopstrategy => '7', amopopr => '@>(box,point)',
   amopmethod => 'brin' },
 
+
+# suffix array index
+{ amopfamily => 'saindex/text_sa_ops', amoplefttype => 'text',
+  amoprighttype => 'text', amopstrategy => '1',
+  amopopr => '@>(text,text)', amopmethod => 'saindex' },
+{ amopfamily => 'saindex/text_sa_ops', amoplefttype => 'text',
+  amoprighttype => 'text', amopstrategy => '2',
+  amopopr => '^@(text,text)', amopmethod => 'saindex' },
+{ amopfamily => 'saindex/text_sa_ops', amoplefttype => 'text',
+  amoprighttype => 'text', amopstrategy => '3',
+  amopopr => '$@(text,text)', amopmethod => 'saindex' },
 ]

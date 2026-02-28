@@ -1996,4 +1996,9 @@
 { amprocfamily => 'brin/box_inclusion_ops', amproclefttype => 'box',
   amprocrighttype => 'box', amprocnum => '13', amproc => 'box_contain' },
 
+
+# suffix array index
+{ amprocfamily => 'saindex/text_sa_ops', amproclefttype => 'text',
+  amprocrighttype => 'text', amprocnum => '1',
+  amproc => 'sa_text_cmp' },
 ]

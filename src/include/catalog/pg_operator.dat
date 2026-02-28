@@ -3460,4 +3460,16 @@
   oprcode => 'multirange_after_multirange', oprrest => 'multirangesel',
   oprjoin => 'scalargtjoinsel' },
 
+
+# suffix array index operators
+{ oid => '9520', oid_symbol => 'OID_SA_TEXT_CONTAINS_OP',
+  descr => 'text contains substring (byte-wise)',
+  oprname => '@>', oprleft => 'text', oprright => 'text', oprresult => 'bool',
+  oprcode => 'sa_text_contains', oprrest => 'contsel',
+  oprjoin => 'contjoinsel' },
+{ oid => '9521', oid_symbol => 'OID_SA_TEXT_SUFFIX_OP',
+  descr => 'text ends with suffix (byte-wise)',
+  oprname => '$@', oprleft => 'text', oprright => 'text', oprresult => 'bool',
+  oprcode => 'sa_text_suffix', oprrest => 'contsel',
+  oprjoin => 'contjoinsel' },
 ]

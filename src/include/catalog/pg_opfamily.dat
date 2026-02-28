@@ -305,4 +305,8 @@
 { oid => '6158',
   opfmethod => 'gist', opfname => 'multirange_ops' },
 
+
+# suffix array index
+{ oid => '9530',
+  opfmethod => 'saindex', opfname => 'text_sa_ops' },
 ]
