@@ -45,8 +45,8 @@ SELECT val FROM saindex_test WHERE val @> 'at' ORDER BY val;
 -- ^@ (starts with)
 SELECT val FROM saindex_test WHERE val ^@ 'post' ORDER BY val;
 
--- $@ (ends with)
-SELECT val FROM saindex_test WHERE val $@ 'fix' ORDER BY val;
+-- ~@ (ends with)
+SELECT val FROM saindex_test WHERE val ~@ 'fix' ORDER BY val;
 
 -- ================================================================
 -- Strategy 1: CONTAINS (@>) -- test index scan
@@ -113,7 +113,7 @@ RESET enable_seqscan;
 RESET enable_bitmapscan;
 
 -- ================================================================
--- Strategy 3: SUFFIX ($@) -- test index scan
+-- Strategy 3: SUFFIX (~@) -- test index scan
 -- ================================================================
 
 SET enable_seqscan = off;
@@ -121,22 +121,22 @@ SET enable_bitmapscan = on;
 
 -- Verify index is used
 EXPLAIN (COSTS OFF)
-SELECT val FROM saindex_test WHERE val $@ 'fix' ORDER BY val;
+SELECT val FROM saindex_test WHERE val ~@ 'fix' ORDER BY val;
 
 -- Basic suffix
-SELECT val FROM saindex_test WHERE val $@ 'fix' ORDER BY val;
+SELECT val FROM saindex_test WHERE val ~@ 'fix' ORDER BY val;
 
 -- Single-char suffix
-SELECT val FROM saindex_test WHERE val $@ 't' ORDER BY val;
+SELECT val FROM saindex_test WHERE val ~@ 't' ORDER BY val;
 
 -- Full string match
-SELECT val FROM saindex_test WHERE val $@ 'cat' ORDER BY val;
+SELECT val FROM saindex_test WHERE val ~@ 'cat' ORDER BY val;
 
 -- No match
-SELECT val FROM saindex_test WHERE val $@ 'zzz' ORDER BY val;
+SELECT val FROM saindex_test WHERE val ~@ 'zzz' ORDER BY val;
 
 -- Suffix matching multiple values
-SELECT val FROM saindex_test WHERE val $@ 'ld' ORDER BY val;
+SELECT val FROM saindex_test WHERE val ~@ 'ld' ORDER BY val;
 
 RESET enable_seqscan;
 RESET enable_bitmapscan;
@@ -190,7 +190,7 @@ SELECT * FROM seq_prefix EXCEPT SELECT * FROM idx_prefix;
 SET enable_seqscan = off;
 SET enable_bitmapscan = on;
 CREATE TEMP TABLE idx_suffix AS
-  SELECT val FROM saindex_test WHERE val $@ 'es' ORDER BY val;
+  SELECT val FROM saindex_test WHERE val ~@ 'es' ORDER BY val;
 RESET enable_seqscan;
 RESET enable_bitmapscan;
 
@@ -198,7 +198,7 @@ SET enable_seqscan = on;
 SET enable_bitmapscan = off;
 SET enable_indexscan = off;
 CREATE TEMP TABLE seq_suffix AS
-  SELECT val FROM saindex_test WHERE val $@ 'es' ORDER BY val;
+  SELECT val FROM saindex_test WHERE val ~@ 'es' ORDER BY val;
 RESET enable_seqscan;
 RESET enable_bitmapscan;
 RESET enable_indexscan;
@@ -228,7 +228,7 @@ SET enable_bitmapscan = on;
 
 SELECT val FROM saindex_empty WHERE val @> 'test';
 SELECT val FROM saindex_empty WHERE val ^@ 'test';
-SELECT val FROM saindex_empty WHERE val $@ 'test';
+SELECT val FROM saindex_empty WHERE val ~@ 'test';
 
 RESET enable_seqscan;
 RESET enable_bitmapscan;
@@ -284,7 +284,7 @@ SELECT count(*) FROM saindex_large WHERE val @> '_data_42';
 SELECT count(*) FROM saindex_large WHERE val ^@ 'item_5';
 
 -- Suffix
-SELECT count(*) FROM saindex_large WHERE val $@ '_data_0';
+SELECT count(*) FROM saindex_large WHERE val ~@ '_data_0';
 
 RESET enable_seqscan;
 RESET enable_bitmapscan;

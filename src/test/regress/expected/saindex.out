@@ -30,12 +30,13 @@ INSERT INTO saindex_test(val) VALUES
   (NULL);
 -- Create SA index
 CREATE INDEX saindex_test_idx ON saindex_test USING saindex (val);
+NOTICE:  SA index "saindex_test_idx": 88 suffix entries from 19 heap tuples
 -- ================================================================
 -- Basic smoke tests: verify operators work outside of index context
 -- ================================================================
 -- @> (contains substring)
 SELECT val FROM saindex_test WHERE val @> 'at' ORDER BY val;
- val
+ val 
 -----
  bat
  cat
@@ -43,16 +44,16 @@ SELECT val FROM saindex_test WHERE val @> 'at' ORDER BY val;
 
 -- ^@ (starts with)
 SELECT val FROM saindex_test WHERE val ^@ 'post' ORDER BY val;
-    val
+    val     
 ------------
  postfix
  postgres
  postgresql
 (3 rows)
 
--- $@ (ends with)
-SELECT val FROM saindex_test WHERE val $@ 'fix' ORDER BY val;
-   val
+-- ~@ (ends with)
+SELECT val FROM saindex_test WHERE val ~@ 'fix' ORDER BY val;
+   val   
 ---------
  fix
  postfix
@@ -68,8 +69,8 @@ SET enable_bitmapscan = on;
 -- Verify index is used
 EXPLAIN (COSTS OFF)
 SELECT val FROM saindex_test WHERE val @> 'at' ORDER BY val;
-                       QUERY PLAN
----------------------------------------------------------
+                    QUERY PLAN                     
+---------------------------------------------------
  Sort
    Sort Key: val
    ->  Bitmap Heap Scan on saindex_test
@@ -80,7 +81,7 @@ SELECT val FROM saindex_test WHERE val @> 'at' ORDER BY val;
 
 -- Basic contains
 SELECT val FROM saindex_test WHERE val @> 'at' ORDER BY val;
- val
+ val 
 -----
  bat
  cat
@@ -88,7 +89,7 @@ SELECT val FROM saindex_test WHERE val @> 'at' ORDER BY val;
 
 -- Pattern at the beginning of value
 SELECT val FROM saindex_test WHERE val @> 'hel' ORDER BY val;
-     val
+     val     
 -------------
  hello
  hello world
@@ -96,7 +97,7 @@ SELECT val FROM saindex_test WHERE val @> 'hel' ORDER BY val;
 
 -- Pattern at the end of value
 SELECT val FROM saindex_test WHERE val @> 'rld' ORDER BY val;
-     val
+     val     
 -------------
  hello world
  world
@@ -105,7 +106,7 @@ SELECT val FROM saindex_test WHERE val @> 'rld' ORDER BY val;
 
 -- Pattern in the middle
 SELECT val FROM saindex_test WHERE val @> 'llo' ORDER BY val;
-     val
+     val     
 -------------
  hello
  hello world
@@ -113,7 +114,7 @@ SELECT val FROM saindex_test WHERE val @> 'llo' ORDER BY val;
 
 -- Single character
 SELECT val FROM saindex_test WHERE val @> 'x' ORDER BY val;
-   val
+   val   
 ---------
  fix
  postfix
@@ -123,13 +124,13 @@ SELECT val FROM saindex_test WHERE val @> 'x' ORDER BY val;
 
 -- No match
 SELECT val FROM saindex_test WHERE val @> 'xyz' ORDER BY val;
- val
+ val 
 -----
 (0 rows)
 
 -- Longer pattern
 SELECT val FROM saindex_test WHERE val @> 'hello world' ORDER BY val;
-     val
+     val     
 -------------
  hello world
 (1 row)
@@ -144,8 +145,8 @@ SET enable_bitmapscan = on;
 -- Verify index is used
 EXPLAIN (COSTS OFF)
 SELECT val FROM saindex_test WHERE val ^@ 'post' ORDER BY val;
-                       QUERY PLAN
----------------------------------------------------------
+                    QUERY PLAN                     
+---------------------------------------------------
  Sort
    Sort Key: val
    ->  Bitmap Heap Scan on saindex_test
@@ -156,7 +157,7 @@ SELECT val FROM saindex_test WHERE val ^@ 'post' ORDER BY val;
 
 -- Basic prefix
 SELECT val FROM saindex_test WHERE val ^@ 'post' ORDER BY val;
-    val
+    val     
 ------------
  postfix
  postgres
@@ -165,7 +166,7 @@ SELECT val FROM saindex_test WHERE val ^@ 'post' ORDER BY val;
 
 -- Single-char prefix
 SELECT val FROM saindex_test WHERE val ^@ 'c' ORDER BY val;
- val
+ val 
 -----
  cab
  can
@@ -174,20 +175,20 @@ SELECT val FROM saindex_test WHERE val ^@ 'c' ORDER BY val;
 
 -- Full string match
 SELECT val FROM saindex_test WHERE val ^@ 'cat' ORDER BY val;
- val
+ val 
 -----
  cat
 (1 row)
 
 -- No match
 SELECT val FROM saindex_test WHERE val ^@ 'zzz' ORDER BY val;
- val
+ val 
 -----
 (0 rows)
 
 -- Prefix matching multiple values
 SELECT val FROM saindex_test WHERE val ^@ 'ca' ORDER BY val;
- val
+ val 
 -----
  cab
  can
@@ -197,26 +198,26 @@ SELECT val FROM saindex_test WHERE val ^@ 'ca' ORDER BY val;
 RESET enable_seqscan;
 RESET enable_bitmapscan;
 -- ================================================================
--- Strategy 3: SUFFIX ($@) -- test index scan
+-- Strategy 3: SUFFIX (~@) -- test index scan
 -- ================================================================
 SET enable_seqscan = off;
 SET enable_bitmapscan = on;
 -- Verify index is used
 EXPLAIN (COSTS OFF)
-SELECT val FROM saindex_test WHERE val $@ 'fix' ORDER BY val;
-                       QUERY PLAN
----------------------------------------------------------
+SELECT val FROM saindex_test WHERE val ~@ 'fix' ORDER BY val;
+                    QUERY PLAN                     
+---------------------------------------------------
  Sort
    Sort Key: val
    ->  Bitmap Heap Scan on saindex_test
-         Recheck Cond: (val $@ 'fix'::text)
+         Recheck Cond: (val ~@ 'fix'::text)
          ->  Bitmap Index Scan on saindex_test_idx
-               Index Cond: (val $@ 'fix'::text)
+               Index Cond: (val ~@ 'fix'::text)
 (6 rows)
 
 -- Basic suffix
-SELECT val FROM saindex_test WHERE val $@ 'fix' ORDER BY val;
-   val
+SELECT val FROM saindex_test WHERE val ~@ 'fix' ORDER BY val;
+   val   
 ---------
  fix
  postfix
@@ -225,8 +226,8 @@ SELECT val FROM saindex_test WHERE val $@ 'fix' ORDER BY val;
 (4 rows)
 
 -- Single-char suffix
-SELECT val FROM saindex_test WHERE val $@ 't' ORDER BY val;
- val
+SELECT val FROM saindex_test WHERE val ~@ 't' ORDER BY val;
+ val 
 -----
  act
  bat
@@ -234,21 +235,21 @@ SELECT val FROM saindex_test WHERE val $@ 't' ORDER BY val;
 (3 rows)
 
 -- Full string match
-SELECT val FROM saindex_test WHERE val $@ 'cat' ORDER BY val;
- val
+SELECT val FROM saindex_test WHERE val ~@ 'cat' ORDER BY val;
+ val 
 -----
  cat
 (1 row)
 
 -- No match
-SELECT val FROM saindex_test WHERE val $@ 'zzz' ORDER BY val;
- val
+SELECT val FROM saindex_test WHERE val ~@ 'zzz' ORDER BY val;
+ val 
 -----
 (0 rows)
 
 -- Suffix matching multiple values
-SELECT val FROM saindex_test WHERE val $@ 'ld' ORDER BY val;
-     val
+SELECT val FROM saindex_test WHERE val ~@ 'ld' ORDER BY val;
+     val     
 -------------
  hello world
  world
@@ -276,12 +277,12 @@ RESET enable_bitmapscan;
 RESET enable_indexscan;
 -- Should return no rows if results match
 SELECT * FROM idx_contains EXCEPT SELECT * FROM seq_contains;
- val
+ val 
 -----
 (0 rows)
 
 SELECT * FROM seq_contains EXCEPT SELECT * FROM idx_contains;
- val
+ val 
 -----
 (0 rows)
 
@@ -301,12 +302,12 @@ RESET enable_seqscan;
 RESET enable_bitmapscan;
 RESET enable_indexscan;
 SELECT * FROM idx_prefix EXCEPT SELECT * FROM seq_prefix;
- val
+ val 
 -----
 (0 rows)
 
 SELECT * FROM seq_prefix EXCEPT SELECT * FROM idx_prefix;
- val
+ val 
 -----
 (0 rows)
 
@@ -314,24 +315,24 @@ SELECT * FROM seq_prefix EXCEPT SELECT * FROM idx_prefix;
 SET enable_seqscan = off;
 SET enable_bitmapscan = on;
 CREATE TEMP TABLE idx_suffix AS
-  SELECT val FROM saindex_test WHERE val $@ 'es' ORDER BY val;
+  SELECT val FROM saindex_test WHERE val ~@ 'es' ORDER BY val;
 RESET enable_seqscan;
 RESET enable_bitmapscan;
 SET enable_seqscan = on;
 SET enable_bitmapscan = off;
 SET enable_indexscan = off;
 CREATE TEMP TABLE seq_suffix AS
-  SELECT val FROM saindex_test WHERE val $@ 'es' ORDER BY val;
+  SELECT val FROM saindex_test WHERE val ~@ 'es' ORDER BY val;
 RESET enable_seqscan;
 RESET enable_bitmapscan;
 RESET enable_indexscan;
 SELECT * FROM idx_suffix EXCEPT SELECT * FROM seq_suffix;
- val
+ val 
 -----
 (0 rows)
 
 SELECT * FROM seq_suffix EXCEPT SELECT * FROM idx_suffix;
- val
+ val 
 -----
 (0 rows)
 
@@ -342,9 +343,9 @@ SELECT * FROM seq_suffix EXCEPT SELECT * FROM idx_suffix;
 SET enable_seqscan = off;
 SET enable_bitmapscan = on;
 SELECT count(*) FROM saindex_test WHERE val @> '';
- count
+ count 
 -------
-    18
+    17
 (1 row)
 
 RESET enable_seqscan;
@@ -352,20 +353,21 @@ RESET enable_bitmapscan;
 -- Index on an empty table
 CREATE TABLE saindex_empty(val text);
 CREATE INDEX saindex_empty_idx ON saindex_empty USING saindex (val);
+NOTICE:  SA index "saindex_empty_idx": 0 suffix entries from 0 heap tuples
 SET enable_seqscan = off;
 SET enable_bitmapscan = on;
 SELECT val FROM saindex_empty WHERE val @> 'test';
- val
+ val 
 -----
 (0 rows)
 
 SELECT val FROM saindex_empty WHERE val ^@ 'test';
- val
+ val 
 -----
 (0 rows)
 
-SELECT val FROM saindex_empty WHERE val $@ 'test';
- val
+SELECT val FROM saindex_empty WHERE val ~@ 'test';
+ val 
 -----
 (0 rows)
 
@@ -375,10 +377,11 @@ DROP TABLE saindex_empty;
 -- Index with reloption: custom prefix length
 CREATE INDEX saindex_test_short_idx ON saindex_test
   USING saindex (val) WITH (max_prefix_len = 16);
+NOTICE:  SA index "saindex_test_short_idx": 88 suffix entries from 19 heap tuples
 SET enable_seqscan = off;
 SET enable_bitmapscan = on;
 SELECT val FROM saindex_test WHERE val @> 'post' ORDER BY val;
-    val
+    val     
 ------------
  postfix
  postgres
@@ -391,10 +394,11 @@ DROP INDEX saindex_test_short_idx;
 -- Drop and recreate
 DROP INDEX saindex_test_idx;
 CREATE INDEX saindex_test_idx ON saindex_test USING saindex (val);
+NOTICE:  SA index "saindex_test_idx": 88 suffix entries from 19 heap tuples
 SET enable_seqscan = off;
 SET enable_bitmapscan = on;
 SELECT val FROM saindex_test WHERE val @> 'cat' ORDER BY val;
- val
+ val 
 -----
  cat
 (1 row)
@@ -409,25 +413,26 @@ INSERT INTO saindex_large
   SELECT 'item_' || g || '_data_' || (g % 100)
   FROM generate_series(1, 1000) g;
 CREATE INDEX saindex_large_idx ON saindex_large USING saindex (val);
+NOTICE:  SA index "saindex_large_idx": 15793 suffix entries from 1000 heap tuples
 SET enable_seqscan = off;
 SET enable_bitmapscan = on;
 -- Contains
 SELECT count(*) FROM saindex_large WHERE val @> '_data_42';
- count
+ count 
 -------
     10
 (1 row)
 
 -- Prefix
 SELECT count(*) FROM saindex_large WHERE val ^@ 'item_5';
- count
+ count 
 -------
    111
 (1 row)
 
 -- Suffix
-SELECT count(*) FROM saindex_large WHERE val $@ '_data_0';
- count
+SELECT count(*) FROM saindex_large WHERE val ~@ '_data_0';
+ count 
 -------
     10
 (1 row)

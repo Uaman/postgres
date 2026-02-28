@@ -66,12 +66,12 @@ test: select_into select_distinct select_distinct_on select_implicit select_havi
 # ----------
 # Another group of parallel tests
 # ----------
-test: brin gin gist spgist saindex privileges init_privs security_label collate matview lock replica_identity rowsecurity object_address tablesample groupingsets drop_operator password identity generated_stored join_hash
+test: brin gin gist spgist privileges init_privs security_label collate matview lock replica_identity rowsecurity object_address tablesample groupingsets drop_operator password identity generated_stored join_hash
 
 # ----------
-# Additional BRIN tests
+# Additional BRIN and SA index tests
 # ----------
-test: brin_bloom brin_multi
+test: brin_bloom brin_multi saindex
 
 # ----------
 # Another group of parallel tests

@@ -3237,5 +3237,5 @@
   amopopr => '^@(text,text)', amopmethod => 'saindex' },
 { amopfamily => 'saindex/text_sa_ops', amoplefttype => 'text',
   amoprighttype => 'text', amopstrategy => '3',
-  amopopr => '$@(text,text)', amopmethod => 'saindex' },
+  amopopr => '~@(text,text)', amopmethod => 'saindex' },
 ]

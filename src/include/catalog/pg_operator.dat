@@ -3469,7 +3469,7 @@
   oprjoin => 'contjoinsel' },
 { oid => '9521', oid_symbol => 'OID_SA_TEXT_SUFFIX_OP',
   descr => 'text ends with suffix (byte-wise)',
-  oprname => '$@', oprleft => 'text', oprright => 'text', oprresult => 'bool',
+  oprname => '~@', oprleft => 'text', oprright => 'text', oprresult => 'bool',
   oprcode => 'sa_text_suffix', oprrest => 'contsel',
   oprjoin => 'contjoinsel' },
 ]
