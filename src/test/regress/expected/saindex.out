@@ -406,6 +406,481 @@ SELECT val FROM saindex_test WHERE val @> 'cat' ORDER BY val;
 RESET enable_seqscan;
 RESET enable_bitmapscan;
 -- ================================================================
+-- Repeated characters (classic suffix array edge cases)
+-- Strings like 'aaa', 'ababab', 'banana' have many overlapping
+-- suffix pairs and stress the binary-search deduplication logic.
+-- ================================================================
+CREATE TABLE saindex_repeated(id serial, val text) WITH (autovacuum_enabled = off);
+INSERT INTO saindex_repeated(val) VALUES
+  ('aaa'),
+  ('aaaaa'),
+  ('ababab'),
+  ('abcabc'),
+  ('abababab'),
+  ('aabaab'),
+  ('xxyyzz'),
+  ('banana');
+CREATE INDEX saindex_repeated_idx ON saindex_repeated USING saindex (val);
+NOTICE:  SA index "saindex_repeated_idx": 46 suffix entries from 8 heap tuples
+SET enable_seqscan = off;
+SET enable_bitmapscan = on;
+-- Repeated single character
+SELECT val FROM saindex_repeated WHERE val @> 'aa' ORDER BY val;
+  val   
+--------
+ aaa
+ aaaaa
+ aabaab
+(3 rows)
+
+-- Alternating two-char pattern
+SELECT val FROM saindex_repeated WHERE val @> 'aba' ORDER BY val;
+   val    
+----------
+ aabaab
+ ababab
+ abababab
+(3 rows)
+
+-- Pattern appearing multiple times in same string
+SELECT val FROM saindex_repeated WHERE val @> 'ab' ORDER BY val;
+   val    
+----------
+ aabaab
+ ababab
+ abababab
+ abcabc
+(4 rows)
+
+-- 'ana' occurs twice in 'banana'
+SELECT val FROM saindex_repeated WHERE val @> 'ana' ORDER BY val;
+  val   
+--------
+ banana
+(1 row)
+
+-- Prefix
+SELECT val FROM saindex_repeated WHERE val ^@ 'ab' ORDER BY val;
+   val    
+----------
+ ababab
+ abababab
+ abcabc
+(3 rows)
+
+-- Suffix
+SELECT val FROM saindex_repeated WHERE val ~@ 'ab' ORDER BY val;
+   val    
+----------
+ aabaab
+ ababab
+ abababab
+(3 rows)
+
+-- Correctness: index vs seqscan
+CREATE TEMP TABLE idx_repeated AS
+  SELECT val FROM saindex_repeated WHERE val @> 'ab' ORDER BY val;
+RESET enable_seqscan;
+RESET enable_bitmapscan;
+SET enable_seqscan = on;
+SET enable_bitmapscan = off;
+SET enable_indexscan = off;
+CREATE TEMP TABLE seq_repeated AS
+  SELECT val FROM saindex_repeated WHERE val @> 'ab' ORDER BY val;
+RESET enable_seqscan;
+RESET enable_bitmapscan;
+RESET enable_indexscan;
+SELECT * FROM idx_repeated EXCEPT SELECT * FROM seq_repeated;
+ val 
+-----
+(0 rows)
+
+SELECT * FROM seq_repeated EXCEPT SELECT * FROM idx_repeated;
+ val 
+-----
+(0 rows)
+
+DROP TABLE saindex_repeated;
+-- ================================================================
+-- Mississippi tests (canonical suffix array test case)
+-- 'mississippi' has many repeated substrings and is the standard
+-- benchmark string for suffix array / suffix tree algorithms.
+-- ================================================================
+CREATE TABLE saindex_mississippi(id serial, val text) WITH (autovacuum_enabled = off);
+INSERT INTO saindex_mississippi(val) VALUES
+  ('mississippi'),
+  ('missouri'),
+  ('miss'),
+  ('ippi'),
+  ('issi'),
+  ('ssissippi'),
+  ('ab'),
+  ('ba'),
+  ('hello'),
+  ('world');
+CREATE INDEX saindex_mississippi_idx ON saindex_mississippi USING saindex (val);
+NOTICE:  SA index "saindex_mississippi_idx": 54 suffix entries from 10 heap tuples
+SET enable_seqscan = off;
+SET enable_bitmapscan = on;
+-- Various substrings of 'mississippi'
+SELECT val FROM saindex_mississippi WHERE val @> 'issi' ORDER BY val;
+     val     
+-------------
+ issi
+ mississippi
+ ssissippi
+(3 rows)
+
+SELECT val FROM saindex_mississippi WHERE val @> 'ssi'  ORDER BY val;
+     val     
+-------------
+ issi
+ mississippi
+ ssissippi
+(3 rows)
+
+SELECT val FROM saindex_mississippi WHERE val @> 'iss'  ORDER BY val;
+     val     
+-------------
+ issi
+ miss
+ mississippi
+ missouri
+ ssissippi
+(5 rows)
+
+SELECT val FROM saindex_mississippi WHERE val @> 'ss'   ORDER BY val;
+     val     
+-------------
+ issi
+ miss
+ mississippi
+ missouri
+ ssissippi
+(5 rows)
+
+SELECT val FROM saindex_mississippi WHERE val @> 'pp'   ORDER BY val;
+     val     
+-------------
+ ippi
+ mississippi
+ ssissippi
+(3 rows)
+
+SELECT val FROM saindex_mississippi WHERE val @> 'pi'   ORDER BY val;
+     val     
+-------------
+ ippi
+ mississippi
+ ssissippi
+(3 rows)
+
+SELECT val FROM saindex_mississippi WHERE val @> 'miss' ORDER BY val;
+     val     
+-------------
+ miss
+ mississippi
+ missouri
+(3 rows)
+
+-- Prefix queries
+SELECT val FROM saindex_mississippi WHERE val ^@ 'miss' ORDER BY val;
+     val     
+-------------
+ miss
+ mississippi
+ missouri
+(3 rows)
+
+SELECT val FROM saindex_mississippi WHERE val ^@ 'mis'  ORDER BY val;
+     val     
+-------------
+ miss
+ mississippi
+ missouri
+(3 rows)
+
+-- Suffix queries
+SELECT val FROM saindex_mississippi WHERE val ~@ 'ippi' ORDER BY val;
+     val     
+-------------
+ ippi
+ mississippi
+ ssissippi
+(3 rows)
+
+SELECT val FROM saindex_mississippi WHERE val ~@ 'ppi'  ORDER BY val;
+     val     
+-------------
+ ippi
+ mississippi
+ ssissippi
+(3 rows)
+
+-- Correctness: index vs seqscan
+CREATE TEMP TABLE idx_miss AS
+  SELECT val FROM saindex_mississippi WHERE val @> 'issi' ORDER BY val;
+RESET enable_seqscan;
+RESET enable_bitmapscan;
+SET enable_seqscan = on;
+SET enable_bitmapscan = off;
+SET enable_indexscan = off;
+CREATE TEMP TABLE seq_miss AS
+  SELECT val FROM saindex_mississippi WHERE val @> 'issi' ORDER BY val;
+RESET enable_seqscan;
+RESET enable_bitmapscan;
+RESET enable_indexscan;
+SELECT * FROM idx_miss EXCEPT SELECT * FROM seq_miss;
+ val 
+-----
+(0 rows)
+
+SELECT * FROM seq_miss EXCEPT SELECT * FROM idx_miss;
+ val 
+-----
+(0 rows)
+
+DROP TABLE saindex_mississippi;
+-- ================================================================
+-- Special strings: spaces, digits, punctuation, uppercase
+-- Tests that byte-level suffix array handles non-alpha chars.
+-- ================================================================
+CREATE TABLE saindex_special(id serial, val text) WITH (autovacuum_enabled = off);
+INSERT INTO saindex_special(val) VALUES
+  (' '),            -- single space
+  ('  '),           -- double space
+  ('123'),          -- digits only
+  ('abc 123'),      -- space in middle
+  ('   leading'),   -- leading spaces
+  ('trailing   '),  -- trailing spaces
+  ('a b c'),        -- alternating spaces
+  ('hello world'),  -- space separating words
+  ('test test'),    -- repeated word with space
+  ('!@#'),          -- special chars
+  ('0123456789'),   -- all digits
+  ('UPPERCASE');    -- uppercase letters
+CREATE INDEX saindex_special_idx ON saindex_special USING saindex (val);
+NOTICE:  SA index "saindex_special_idx": 81 suffix entries from 12 heap tuples
+SET enable_seqscan = off;
+SET enable_bitmapscan = on;
+-- Space in data
+SELECT val FROM saindex_special WHERE val @> ' '   ORDER BY val;
+     val     
+-------------
+  
+   
+    leading
+ a b c
+ abc 123
+ hello world
+ test test
+ trailing   
+(8 rows)
+
+SELECT val FROM saindex_special WHERE val @> '  '  ORDER BY val;
+     val     
+-------------
+   
+    leading
+ trailing   
+(3 rows)
+
+-- Starts/ends with space
+SELECT val FROM saindex_special WHERE val ^@ ' '   ORDER BY val;
+    val     
+------------
+  
+   
+    leading
+(3 rows)
+
+SELECT val FROM saindex_special WHERE val ~@ ' '   ORDER BY val;
+     val     
+-------------
+  
+   
+ trailing   
+(3 rows)
+
+-- Digit patterns
+SELECT val FROM saindex_special WHERE val @> '123' ORDER BY val;
+    val     
+------------
+ 0123456789
+ 123
+ abc 123
+(3 rows)
+
+SELECT val FROM saindex_special WHERE val ^@ '123' ORDER BY val;
+ val 
+-----
+ 123
+(1 row)
+
+SELECT val FROM saindex_special WHERE val ~@ '123' ORDER BY val;
+   val   
+---------
+ 123
+ abc 123
+(2 rows)
+
+-- Space inside the pattern
+SELECT val FROM saindex_special WHERE val @> 'lo w'  ORDER BY val;
+     val     
+-------------
+ hello world
+(1 row)
+
+SELECT val FROM saindex_special WHERE val @> ' b '   ORDER BY val;
+  val  
+-------
+ a b c
+(1 row)
+
+-- Uppercase
+SELECT val FROM saindex_special WHERE val @> 'UPPER' ORDER BY val;
+    val    
+-----------
+ UPPERCASE
+(1 row)
+
+SELECT val FROM saindex_special WHERE val ^@ 'UPPER' ORDER BY val;
+    val    
+-----------
+ UPPERCASE
+(1 row)
+
+SELECT val FROM saindex_special WHERE val ~@ 'CASE'  ORDER BY val;
+    val    
+-----------
+ UPPERCASE
+(1 row)
+
+-- Correctness: index vs seqscan
+CREATE TEMP TABLE idx_special AS
+  SELECT val FROM saindex_special WHERE val @> ' ' ORDER BY val;
+RESET enable_seqscan;
+RESET enable_bitmapscan;
+SET enable_seqscan = on;
+SET enable_bitmapscan = off;
+SET enable_indexscan = off;
+CREATE TEMP TABLE seq_special AS
+  SELECT val FROM saindex_special WHERE val @> ' ' ORDER BY val;
+RESET enable_seqscan;
+RESET enable_bitmapscan;
+RESET enable_indexscan;
+SELECT * FROM idx_special EXCEPT SELECT * FROM seq_special;
+ val 
+-----
+(0 rows)
+
+SELECT * FROM seq_special EXCEPT SELECT * FROM idx_special;
+ val 
+-----
+(0 rows)
+
+DROP TABLE saindex_special;
+-- ================================================================
+-- Unicode / multi-byte character tests
+-- The suffix array operates on raw bytes (UTF-8), so multi-byte
+-- characters work as long as patterns are also valid UTF-8.
+-- ================================================================
+CREATE TABLE saindex_unicode(id serial, val text) WITH (autovacuum_enabled = off);
+INSERT INTO saindex_unicode(val) VALUES
+  ('привіт світ'),      -- Ukrainian: hello world
+  ('привіт друг'),      -- Ukrainian: hello friend
+  ('світовий мир'),     -- Ukrainian: world peace
+  ('こんにちは世界'),   -- Japanese: hello world
+  ('世界平和'),          -- Japanese: world peace
+  ('你好世界'),          -- Chinese: hello world
+  ('café'),             -- accented Latin
+  ('naïve'),            -- diaeresis
+  ('résumé');           -- accented vowels
+CREATE INDEX saindex_unicode_idx ON saindex_unicode USING saindex (val);
+NOTICE:  SA index "saindex_unicode_idx": 129 suffix entries from 9 heap tuples
+SET enable_seqscan = off;
+SET enable_bitmapscan = on;
+-- Cyrillic contains / prefix / suffix
+SELECT val FROM saindex_unicode WHERE val @> 'світ'    ORDER BY val;
+           val           
+-------------------------
+ привіт світ
+ світовий мир
+(2 rows)
+
+SELECT val FROM saindex_unicode WHERE val ^@ 'привіт'  ORDER BY val;
+          val          
+-----------------------
+ привіт друг
+ привіт світ
+(2 rows)
+
+SELECT val FROM saindex_unicode WHERE val ~@ 'мир'     ORDER BY val;
+           val           
+-------------------------
+ світовий мир
+(1 row)
+
+-- CJK contains / prefix / suffix
+SELECT val FROM saindex_unicode WHERE val @> '世界'    ORDER BY val;
+          val          
+-----------------------
+ こんにちは世界
+ 世界平和
+ 你好世界
+(3 rows)
+
+SELECT val FROM saindex_unicode WHERE val ^@ '世界'    ORDER BY val;
+     val      
+--------------
+ 世界平和
+(1 row)
+
+SELECT val FROM saindex_unicode WHERE val ~@ '平和'    ORDER BY val;
+     val      
+--------------
+ 世界平和
+(1 row)
+
+-- Accented Latin
+SELECT val FROM saindex_unicode WHERE val @> 'é'       ORDER BY val;
+   val    
+----------
+ café
+ résumé
+(2 rows)
+
+SELECT val FROM saindex_unicode WHERE val ~@ 'umé'     ORDER BY val;
+   val    
+----------
+ résumé
+(1 row)
+
+-- Correctness: index vs seqscan for CJK
+CREATE TEMP TABLE idx_unicode AS
+  SELECT val FROM saindex_unicode WHERE val @> '世界' ORDER BY val;
+RESET enable_seqscan;
+RESET enable_bitmapscan;
+SET enable_seqscan = on;
+SET enable_bitmapscan = off;
+SET enable_indexscan = off;
+CREATE TEMP TABLE seq_unicode AS
+  SELECT val FROM saindex_unicode WHERE val @> '世界' ORDER BY val;
+RESET enable_seqscan;
+RESET enable_bitmapscan;
+RESET enable_indexscan;
+SELECT * FROM idx_unicode EXCEPT SELECT * FROM seq_unicode;
+ val 
+-----
+(0 rows)
+
+SELECT * FROM seq_unicode EXCEPT SELECT * FROM idx_unicode;
+ val 
+-----
+(0 rows)
+
+DROP TABLE saindex_unicode;
+-- ================================================================
 -- Larger dataset: test with generated data
 -- ================================================================
 CREATE TABLE saindex_large(val text) WITH (autovacuum_enabled = off);

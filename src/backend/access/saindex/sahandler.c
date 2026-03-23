@@ -76,9 +76,10 @@ sahandler(PG_FUNCTION_ARGS)
 	amroutine->aminsert = NULL;
 	amroutine->aminsertcleanup = NULL;
 
-	/* Vacuum (not supported yet) */
+	/* Vacuum: ambulkdelete not yet supported; vacuumcleanup is a no-op
+	 * required so ANALYZE (which calls index_vacuum_cleanup) doesn't error. */
 	amroutine->ambulkdelete = NULL;
-	amroutine->amvacuumcleanup = NULL;
+	amroutine->amvacuumcleanup = savacuumcleanup;
 
 	/* Index return */
 	amroutine->amcanreturn = NULL;			/* no index-only scans */
@@ -131,6 +132,28 @@ bool
 savalidate(Oid opclassoid)
 {
 	return true;
+}
+
+
+/* ----------------------------------------------------------------
+ *				Vacuum
+ * ----------------------------------------------------------------
+ */
+
+/*
+ * savacuumcleanup
+ *		Post-vacuum / ANALYZE callback for the SA index.
+ *
+ * Called by index_vacuum_cleanup(), including from the ANALYZE path
+ * (info->analyze_only == true).  Since the suffix-array image is fully
+ * rebuilt during sabuild() and we do not support incremental deletes yet,
+ * there is nothing to do here except return the existing stats struct.
+ */
+IndexBulkDeleteResult *
+savacuumcleanup(IndexVacuumInfo *info, IndexBulkDeleteResult *stats)
+{
+	/* Nothing to do — the SA page is immutable until the next REINDEX. */
+	return stats;
 }
 
 

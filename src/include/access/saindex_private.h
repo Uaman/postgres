@@ -675,6 +675,8 @@ extern bool sa_binary_search(Relation index, SAMetaPageData *meta,
 
 extern Datum sahandler(PG_FUNCTION_ARGS);
 extern bool savalidate(Oid opclassoid);
+extern IndexBulkDeleteResult *savacuumcleanup(IndexVacuumInfo *info,
+											  IndexBulkDeleteResult *stats);
 extern void sacostestimate(struct PlannerInfo *root,
 						   struct IndexPath *path,
 						   double loop_count,
