@@ -5,31 +5,25 @@
  *	Build pipeline:
  *
  *	  1. GENERATE - Scan the heap.  For each row's text value, generate
- *	     one SASortItem per suffix position.  All items are accumulated
- *	     in a dynamically-grown in-memory array.  The original text data
- *	     is copied into a dedicated memory context so suffix pointers
- *	     remain valid through sort and write.
+ *	     one bytea sort datum per suffix position and feed it to a
+ *	     tuplesort state.  Each datum encodes: zero-padded prefix key
+ *	     (sort key), big-endian suffixlen (tiebreaker), offset, and heaptid.
  *
- *	  2. SORT - qsort the array by full suffix text (byte-wise, shorter
- *	     first on tie).  This establishes the canonical suffix array order.
+ *	  2. SORT - tuplesort_performsort() sorts all datums by bytea order
+ *	     (byteacmp), which gives the same result as sa_compare_suffixes.
+ *	     tuplesort spills to disk when maintenance_work_mem is exceeded,
+ *	     so very large indexes no longer require all data to fit in RAM.
  *
- *	  3. WRITE SA LEAVES - Iterate sorted items.  For each, construct a
- *	     fixed-size SAEntry (truncated key + LCP + metadata) and write it
- *	     to the current leaf page.  When a page fills, flush and allocate
- *	     the next.
+ *	  3. WRITE ALL SECTIONS - Consume the sorted stream in a single pass.
+ *	     For each datum, decode the payload and simultaneously write:
+ *	       - SA leaf entry (with inline LCP) to the leaf section
+ *	       - Suffix length to the sufflen section
+ *	       - Heap TID to the TID section
+ *	       - Bit to in-memory offset-zero and exact-suffix bitmaps
+ *	     At stream end, flush the two in-memory bitmaps to bitmap pages.
  *
- *	  4. WRITE AUXILIARY ARRAYS - Second pass over sorted items writes:
- *	     - suffix-length array (packed uint16)
- *	     - TID array (packed ItemPointerData)
- *	     - offset-zero bitmap
- *	     - exact-suffix bitmap
- *
- *	  5. FINALIZE - Rewrite the meta page (block 0) with final section
+ *	  4. FINALIZE - Rewrite the meta page (block 0) with final section
  *	     descriptors.  WAL-log all pages.
- *
- *	Memory: all suffix text and the SASortItem array must fit in RAM.
- *	TODO: for very large tables, replace qsort with tuplesort-based
- *	external sort.
  *
  * Copyright (c) 2025, Dmytro Zvazhii
  *
@@ -47,25 +41,96 @@
 #include "storage/smgr.h"
 #include "utils/memutils.h"
 #include "utils/rel.h"
-
-
-/* Initial capacity of the SASortItem array */
-#define SA_INITIAL_ITEMS		1024
+#include "utils/tuplesort.h"
+#include "utils/typcache.h"
 
 
 /* ----------------------------------------------------------------
- *				qsort comparison
+ *				Sort datum encoding / decoding
  * ----------------------------------------------------------------
+ *
+ * Each suffix is encoded as a bytea datum for tuplesort.  The datum
+ * layout is:
+ *
+ *   [0 .. maxPrefixLen-1]         key bytes, zero-padded  (primary sort key)
+ *   [maxPrefixLen .. +1]          suffixlen  big-endian uint16  (tiebreaker)
+ *   [maxPrefixLen+2 .. +5]        offset     big-endian int32
+ *   [maxPrefixLen+6 .. +11]       heaptid    (6 bytes, native order)
+ *
+ * byteacmp on the full datum gives the same order as sa_compare_suffixes:
+ *   - zero-padded key: identical to truncated suffix comparison
+ *   - big-endian suffixlen: shorter suffix sorts first on key tie
+ *   - offset and heaptid don't affect ordering (suffixlen breaks all ties
+ *     for same-string values; different strings always differ in key bytes)
  */
 
-static int
-sa_sort_cmp(const void *a, const void *b)
+/*
+ * sa_encode_suffix
+ *		Encode one suffix into a palloc'd bytea datum for tuplesort.
+ */
+static Datum
+sa_encode_suffix(const char *suffix, int suffixlen, int32 offset,
+				 ItemPointer heaptid, int32 maxPrefixLen, int32 datumSize)
 {
-	const SASortItem *ia = (const SASortItem *) a;
-	const SASortItem *ib = (const SASortItem *) b;
+	bytea	   *result;
+	char	   *data;
+	int			copyLen;
+	uint16		sl_be;
+	uint32		off_be;
 
-	return sa_compare_suffixes(ia->suffix, ia->suffixlen,
-							   ib->suffix, ib->suffixlen);
+	result = (bytea *) palloc(datumSize);
+	SET_VARSIZE(result, datumSize);
+	data = VARDATA(result);
+
+	/* Zero-fill key area, then copy truncated suffix bytes */
+	MemSet(data, 0, maxPrefixLen);
+	copyLen = Min(suffixlen, maxPrefixLen);
+	memcpy(data, suffix, copyLen);
+
+	/* Big-endian uint16 suffixlen (tiebreaker: shorter first) */
+	sl_be = pg_hton16((uint16) Min(suffixlen, PG_UINT16_MAX));
+	memcpy(data + maxPrefixLen, &sl_be, sizeof(uint16));
+
+	/* Big-endian int32 offset */
+	off_be = pg_hton32((uint32) offset);
+	memcpy(data + maxPrefixLen + sizeof(uint16), &off_be, sizeof(int32));
+
+	/* heaptid (6 bytes) */
+	memcpy(data + maxPrefixLen + sizeof(uint16) + sizeof(int32),
+		   heaptid, sizeof(ItemPointerData));
+
+	return PointerGetDatum(result);
+}
+
+/*
+ * sa_decode_datum
+ *		Decode a sort datum returned by tuplesort_getdatum.
+ *
+ * *keyOut points into the datum's memory and is valid only while the
+ * datum is alive (i.e., until the next tuplesort_getdatum call with
+ * copy=false).
+ */
+static void
+sa_decode_datum(Datum d, int32 maxPrefixLen,
+				char **keyOut, uint16 *suffixlenOut,
+				int32 *offsetOut, ItemPointerData *heaptidOut)
+{
+	bytea	   *val = DatumGetByteaP(d);
+	char	   *data = VARDATA(val);
+	uint16		sl_be;
+	uint32		off_be;
+
+	*keyOut = data;
+
+	memcpy(&sl_be, data + maxPrefixLen, sizeof(uint16));
+	*suffixlenOut = pg_ntoh16(sl_be);
+
+	memcpy(&off_be, data + maxPrefixLen + sizeof(uint16), sizeof(int32));
+	*offsetOut = (int32) pg_ntoh32(off_be);
+
+	memcpy(heaptidOut,
+		   data + maxPrefixLen + sizeof(uint16) + sizeof(int32),
+		   sizeof(ItemPointerData));
 }
 
 
@@ -76,397 +141,323 @@ sa_sort_cmp(const void *a, const void *b)
 
 /*
  * sabuild_callback
- *		Process one heap tuple: extract the text value and generate
- *		one SASortItem for every suffix position.
- *
- * Text data is copied into buildstate->textCtx so that suffix pointers
- * remain valid after the heap scan moves on to subsequent tuples.
+ *		Process one heap tuple: extract the text value and feed one
+ *		sort datum per suffix position to the tuplesort state.
  */
 static void
 sabuild_callback(Relation index, ItemPointer tid, Datum *values,
 				 bool *isnull, bool tupleIsAlive, void *state)
 {
 	SABuildState   *bs = (SABuildState *) state;
-	MemoryContext	oldCtx;
 	char		   *data;
-	char		   *dataCopy;
 	int				len;
 	int				i;
 
-	/* Skip NULLs — no suffixes to index */
+	/* Skip NULLs and empty values — no suffixes to index */
 	if (isnull[0])
 		return;
 
-	/* Extract raw bytes from the text/varchar/bytea datum */
 	data = VARDATA_ANY(values[0]);
 	len = VARSIZE_ANY_EXHDR(values[0]);
 
-	/* Skip empty values — no suffixes */
 	if (len == 0)
 		return;
 
 	bs->numHeapTuples++;
 
-	/*
-	 * Copy the text value into textCtx.  All suffixes of this value share
-	 * this single allocation — they just point to different offsets within it.
-	 */
-	oldCtx = MemoryContextSwitchTo(bs->textCtx);
-	dataCopy = palloc(len);
-	memcpy(dataCopy, data, len);
-	MemoryContextSwitchTo(oldCtx);
-
-	/*
-	 * Generate one SASortItem per suffix position [0, len).
-	 * Grow the items array if needed.
-	 */
 	for (i = 0; i < len; i++)
 	{
-		SASortItem *item;
+		Datum	d;
 
-		/* Grow array with doubling strategy */
-		if (bs->numEntries >= bs->maxEntries)
-		{
-			bs->maxEntries = Max(bs->maxEntries * 2, SA_INITIAL_ITEMS);
-			bs->items = repalloc(bs->items,
-								 bs->maxEntries * sizeof(SASortItem));
-		}
-
-		item = &bs->items[bs->numEntries];
-		item->suffix = dataCopy + i;
-		item->suffixlen = len - i;
-		ItemPointerCopy(tid, &item->heaptid);
-		item->offset = i;
+		d = sa_encode_suffix(data + i, len - i, i, tid,
+							 bs->maxPrefixLen, bs->datumSize);
+		tuplesort_putdatum(bs->sortstate, d, false);
+		pfree(DatumGetPointer(d));
 		bs->numEntries++;
 	}
 }
 
 
 /* ----------------------------------------------------------------
- *				Section writers
+ *				Unified section writer
  * ----------------------------------------------------------------
- *
- * Each writer function iterates the sorted SASortItem array and writes
- * one section of the index.  Pages are allocated sequentially via
- * ReadBuffer(index, P_NEW), filled, marked dirty, and released.
- *
- * All writers return the starting BlockNumber and page count.
  */
 
 /*
- * sa_write_leaves
- *		Write the SA leaf section: sorted SAEntry records with inline LCP.
+ * sa_flush_bitmaps
+ *		Write two in-memory bitmaps to pages in the bitmap section.
  *
- * This is the core suffix array.  For each sorted item, we:
- *   - Compute LCP with the previous item
- *   - Construct a fixed-size SAEntry (truncated key, zero-padded)
- *   - Write it to the current leaf page
- *
- * On return, *startBlkno and *numPages describe the leaf section.
+ * The offset-zero bitmap pages are written contiguously.  This matches
+ * the layout expected by SABitmapBaseBlkno().
  */
 static void
-sa_write_leaves(Relation index, SABuildState *bs,
-				BlockNumber *startBlkno, int32 *numPages)
-{
-	int32		maxPrefixLen = bs->maxPrefixLen;
-	int32		entrySize = bs->entrySize;
-	int32		perPage = bs->entriesPerPage;
-	Buffer		curBuf = InvalidBuffer;
-	Buffer		prevBuf = InvalidBuffer;
-	Page		curPage = NULL;
-	int			curSlot = 0;
-	BlockNumber firstBlkno = InvalidBlockNumber;
-	int32		pagesWritten = 0;
-	int64		i;
-
-	for (i = 0; i < bs->numEntries; i++)
-	{
-		SASortItem *item = &bs->items[i];
-		SAEntry	   *entry;
-		int			lcp;
-		int			copyLen;
-
-		/* Allocate a new page when the current one is full (or first time) */
-		if (curBuf == InvalidBuffer || curSlot >= perPage)
-		{
-			/* Flush previous page before moving on */
-			if (prevBuf != InvalidBuffer)
-			{
-				MarkBufferDirty(prevBuf);
-				UnlockReleaseBuffer(prevBuf);
-			}
-			prevBuf = curBuf;
-
-			curBuf = ReadBuffer(index, P_NEW);
-			LockBuffer(curBuf, BUFFER_LOCK_EXCLUSIVE);
-			curPage = BufferGetPage(curBuf);
-			SAInitPage(curPage, SA_PAGE_LEAF, BufferGetPageSize(curBuf));
-
-			if (firstBlkno == InvalidBlockNumber)
-				firstBlkno = BufferGetBlockNumber(curBuf);
-
-			/* Set previous page's sa_next forward link */
-			if (prevBuf != InvalidBuffer)
-			{
-				SAPageGetOpaque(BufferGetPage(prevBuf))->sa_next =
-					BufferGetBlockNumber(curBuf);
-				MarkBufferDirty(prevBuf);
-				UnlockReleaseBuffer(prevBuf);
-				prevBuf = InvalidBuffer;
-			}
-
-			curSlot = 0;
-			pagesWritten++;
-		}
-
-		/* Compute LCP with the previous entry in sorted order */
-		lcp = 0;
-		if (i > 0)
-		{
-			SASortItem *prev = &bs->items[i - 1];
-
-			lcp = sa_compute_lcp(prev->suffix, prev->suffixlen,
-								 item->suffix, item->suffixlen,
-								 maxPrefixLen);
-		}
-
-		/* Fill the SAEntry on the current page */
-		entry = SAPageGetEntry(curPage, curSlot, entrySize);
-
-		entry->sa_lcp = lcp;
-		entry->sa_offset = item->offset;
-		ItemPointerCopy(&item->heaptid, &entry->sa_heaptid);
-		entry->sa_suffixlen = (uint16) Min(item->suffixlen, PG_UINT16_MAX);
-
-		/* Copy suffix text, truncated to maxPrefixLen, zero-padded */
-		MemSet(entry->sa_key, 0, maxPrefixLen);
-		copyLen = Min(item->suffixlen, maxPrefixLen);
-		memcpy(entry->sa_key, item->suffix, copyLen);
-
-		curSlot++;
-	}
-
-	/* Flush remaining pages */
-	if (curBuf != InvalidBuffer)
-	{
-		MarkBufferDirty(curBuf);
-		UnlockReleaseBuffer(curBuf);
-	}
-	if (prevBuf != InvalidBuffer)
-	{
-		MarkBufferDirty(prevBuf);
-		UnlockReleaseBuffer(prevBuf);
-	}
-
-	*startBlkno = firstBlkno;
-	*numPages = pagesWritten;
-}
-
-/*
- * sa_write_sufflens
- *		Write the suffix-length array section: packed uint16 values.
- */
-static void
-sa_write_sufflens(Relation index, SABuildState *bs,
-				  BlockNumber *startBlkno, int32 *numPages)
-{
-	Buffer		curBuf = InvalidBuffer;
-	Page		curPage = NULL;
-	uint16	   *slots = NULL;
-	int			curSlot = 0;
-	BlockNumber firstBlkno = InvalidBlockNumber;
-	int32		pagesWritten = 0;
-	int64		i;
-
-	for (i = 0; i < bs->numEntries; i++)
-	{
-		if (curBuf == InvalidBuffer || curSlot >= SA_SUFFLENS_PER_PAGE)
-		{
-			if (curBuf != InvalidBuffer)
-			{
-				MarkBufferDirty(curBuf);
-				UnlockReleaseBuffer(curBuf);
-			}
-
-			curBuf = ReadBuffer(index, P_NEW);
-			LockBuffer(curBuf, BUFFER_LOCK_EXCLUSIVE);
-			curPage = BufferGetPage(curBuf);
-			SAInitPage(curPage, SA_PAGE_SUFFLEN, BufferGetPageSize(curBuf));
-			slots = SAPageGetSufflens(curPage);
-
-			if (firstBlkno == InvalidBlockNumber)
-				firstBlkno = BufferGetBlockNumber(curBuf);
-
-			curSlot = 0;
-			pagesWritten++;
-		}
-
-		slots[curSlot] = (uint16) Min(bs->items[i].suffixlen, PG_UINT16_MAX);
-		curSlot++;
-	}
-
-	if (curBuf != InvalidBuffer)
-	{
-		MarkBufferDirty(curBuf);
-		UnlockReleaseBuffer(curBuf);
-	}
-
-	*startBlkno = firstBlkno;
-	*numPages = pagesWritten;
-}
-
-/*
- * sa_write_tids
- *		Write the TID array section: packed ItemPointerData values.
- */
-static void
-sa_write_tids(Relation index, SABuildState *bs,
-			  BlockNumber *startBlkno, int32 *numPages)
-{
-	Buffer			curBuf = InvalidBuffer;
-	Page			curPage = NULL;
-	ItemPointerData *slots = NULL;
-	int				curSlot = 0;
-	BlockNumber		firstBlkno = InvalidBlockNumber;
-	int32			pagesWritten = 0;
-	int64			i;
-
-	for (i = 0; i < bs->numEntries; i++)
-	{
-		if (curBuf == InvalidBuffer || curSlot >= SA_TIDS_PER_PAGE)
-		{
-			if (curBuf != InvalidBuffer)
-			{
-				MarkBufferDirty(curBuf);
-				UnlockReleaseBuffer(curBuf);
-			}
-
-			curBuf = ReadBuffer(index, P_NEW);
-			LockBuffer(curBuf, BUFFER_LOCK_EXCLUSIVE);
-			curPage = BufferGetPage(curBuf);
-			SAInitPage(curPage, SA_PAGE_TID, BufferGetPageSize(curBuf));
-			slots = SAPageGetTids(curPage);
-
-			if (firstBlkno == InvalidBlockNumber)
-				firstBlkno = BufferGetBlockNumber(curBuf);
-
-			curSlot = 0;
-			pagesWritten++;
-		}
-
-		ItemPointerCopy(&bs->items[i].heaptid, &slots[curSlot]);
-		curSlot++;
-	}
-
-	if (curBuf != InvalidBuffer)
-	{
-		MarkBufferDirty(curBuf);
-		UnlockReleaseBuffer(curBuf);
-	}
-
-	*startBlkno = firstBlkno;
-	*numPages = pagesWritten;
-}
-
-/*
- * sa_write_bitmaps
- *		Write the bitmap section: offset-zero and exact-suffix bitmaps.
- *
- * Both bitmaps are accumulated in memory first (they are small:
- * numEntries / 8 bytes each), then flushed to pages sequentially.
- * Bitmap 0 (offset-zero) pages come first, then bitmap 1 (exact-suffix).
- */
-static void
-sa_write_bitmaps(Relation index, SABuildState *bs,
+sa_flush_bitmaps(Relation index, int64 numEntries,
+				 uint8 *offsetZeroBm,
 				 BlockNumber *startBlkno, int32 *numPages,
 				 uint16 *bitmapFlags)
 {
-	int64		numEntries = bs->numEntries;
-	int32		maxPrefixLen = bs->maxPrefixLen;
-	Size		bitmapBytes;
-	uint8	   *offsetZeroBm;
-	uint8	   *exactSuffixBm;
-	int64		i;
+	Size		bitmapBytes = (numEntries + BITS_PER_BYTE - 1) / BITS_PER_BYTE;
 	BlockNumber firstBlkno = InvalidBlockNumber;
 	int32		pagesWritten = 0;
+	Size		bytesRemaining = bitmapBytes;
+	Size		srcOffset = 0;
 
-	if (numEntries == 0)
+	while (bytesRemaining > 0)
 	{
-		*startBlkno = InvalidBlockNumber;
-		*numPages = 0;
-		*bitmapFlags = 0;
-		return;
+		Buffer	buf;
+		Page	page;
+		Size	chunkSize;
+
+		buf = ReadBuffer(index, P_NEW);
+		LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
+		page = BufferGetPage(buf);
+		SAInitPage(page, SA_PAGE_BITMAP, BufferGetPageSize(buf));
+
+		if (firstBlkno == InvalidBlockNumber)
+			firstBlkno = BufferGetBlockNumber(buf);
+
+		chunkSize = Min(bytesRemaining, (Size) SA_PAGE_DATA_SIZE);
+		memcpy(SAPageGetBitmapData(page),
+			   offsetZeroBm + srcOffset,
+			   chunkSize);
+
+		MarkBufferDirty(buf);
+		UnlockReleaseBuffer(buf);
+
+		srcOffset += chunkSize;
+		bytesRemaining -= chunkSize;
+		pagesWritten++;
 	}
-
-	/* Allocate in-memory bitmaps, zero-initialized (all bits clear) */
-	bitmapBytes = (numEntries + BITS_PER_BYTE - 1) / BITS_PER_BYTE;
-	offsetZeroBm = palloc0(bitmapBytes);
-	exactSuffixBm = palloc0(bitmapBytes);
-
-	/* Populate bitmaps from sorted items */
-	for (i = 0; i < numEntries; i++)
-	{
-		int		bytePos = i / BITS_PER_BYTE;
-		int		bitPos = i % BITS_PER_BYTE;
-
-		/* offset-zero: suffix starts at position 0 in the original value */
-		if (bs->items[i].offset == 0)
-			offsetZeroBm[bytePos] |= (1 << bitPos);
-
-		/* exact-suffix: full suffix fits within stored prefix, no recheck */
-		if (bs->items[i].suffixlen <= maxPrefixLen)
-			exactSuffixBm[bytePos] |= (1 << bitPos);
-	}
-
-	/*
-	 * Write bitmaps to pages.  Each bitmap occupies
-	 * ceil(bitmapBytes / SA_PAGE_DATA_SIZE) pages.
-	 * Order: all offset-zero pages, then all exact-suffix pages.
-	 */
-	{
-		uint8	   *bitmaps[2] = {offsetZeroBm, exactSuffixBm};
-		int			bm;
-
-		for (bm = 0; bm < 2; bm++)
-		{
-			Size	bytesRemaining = bitmapBytes;
-			Size	srcOffset = 0;
-
-			while (bytesRemaining > 0)
-			{
-				Buffer	buf;
-				Page	page;
-				Size	chunkSize;
-
-				buf = ReadBuffer(index, P_NEW);
-				LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
-				page = BufferGetPage(buf);
-				SAInitPage(page, SA_PAGE_BITMAP, BufferGetPageSize(buf));
-
-				if (firstBlkno == InvalidBlockNumber)
-					firstBlkno = BufferGetBlockNumber(buf);
-
-				chunkSize = Min(bytesRemaining, (Size) SA_PAGE_DATA_SIZE);
-				memcpy(SAPageGetBitmapData(page),
-					   bitmaps[bm] + srcOffset,
-					   chunkSize);
-
-				MarkBufferDirty(buf);
-				UnlockReleaseBuffer(buf);
-
-				srcOffset += chunkSize;
-				bytesRemaining -= chunkSize;
-				pagesWritten++;
-			}
-		}
-	}
-
-	pfree(offsetZeroBm);
-	pfree(exactSuffixBm);
 
 	*startBlkno = firstBlkno;
 	*numPages = pagesWritten;
-	*bitmapFlags = SA_BITMAP_OFFSET_ZERO | SA_BITMAP_EXACT_SUFFIX;
+	*bitmapFlags = SA_BITMAP_OFFSET_ZERO;
+}
+
+/*
+ * sa_write_array_section
+ *		Write a contiguous packed-array section from an in-memory buffer.
+ *
+ * itemSize is the per-entry byte size (2 for uint16, 6 for ItemPointerData).
+ * itemsPerPage is computed by the caller from SA_PAGE_DATA_SIZE / itemSize.
+ * pageFlags identifies the page type (SA_PAGE_SUFFLEN or SA_PAGE_TID).
+ *
+ * All pages are written contiguously, which is required for the O(1)
+ * page-to-index mapping used during scans.
+ */
+static void
+sa_write_array_section(Relation index,
+					   const void *buf, int64 numEntries,
+					   Size itemSize, int itemsPerPage,
+					   uint16 pageFlags,
+					   BlockNumber *startBlkno, int32 *numPages)
+{
+	const uint8 *src = (const uint8 *) buf;
+	int64		remaining = numEntries;
+	BlockNumber firstBlkno = InvalidBlockNumber;
+	int32		pagesWritten = 0;
+
+	while (remaining > 0)
+	{
+		int64	count = Min(remaining, (int64) itemsPerPage);
+		Buffer	bufr;
+		Page	page;
+
+		bufr = ReadBuffer(index, P_NEW);
+		LockBuffer(bufr, BUFFER_LOCK_EXCLUSIVE);
+		page = BufferGetPage(bufr);
+		SAInitPage(page, pageFlags, BufferGetPageSize(bufr));
+
+		if (firstBlkno == InvalidBlockNumber)
+			firstBlkno = BufferGetBlockNumber(bufr);
+
+		memcpy(SAPageGetData(page), src, count * itemSize);
+		src += count * itemSize;
+		remaining -= count;
+
+		MarkBufferDirty(bufr);
+		UnlockReleaseBuffer(bufr);
+		pagesWritten++;
+	}
+
+	*startBlkno = firstBlkno;
+	*numPages = pagesWritten;
+}
+
+/*
+ * sa_write_all_sections
+ *		Consume the sorted tuplesort stream and write all four index
+ *		data sections: SA leaves, sufflen array, TID array, and bitmaps.
+ *
+ * The leaf section is written page-by-page during the streaming pass.
+ * Auxiliary data (sufflen, TID, bitmaps) is accumulated in in-memory
+ * arrays during the same pass and written as contiguous sections
+ * afterwards.  This guarantees contiguous block layout for each section,
+ * which is required for the O(1) index-to-page mapping in scan code.
+ *
+ * Memory cost of the aux arrays:
+ *   sufflens : numEntries * 2 bytes
+ *   tids     : numEntries * 6 bytes
+ *   bitmaps  : 2 * ceil(numEntries / 8) bytes
+ * For 320K entries this is about 2.6 MB — negligible.
+ *
+ * On entry, bs->sortstate must be ready to deliver tuples (i.e.,
+ * tuplesort_performsort has been called).  On return, meta is updated
+ * with the block/page counts for each section.
+ */
+static void
+sa_write_all_sections(Relation index, SABuildState *bs, SAMetaPageData *meta)
+{
+	/* ---- Leaf section (streamed) ---- */
+	Buffer		leafBuf = InvalidBuffer;
+	Buffer		prevLeafBuf = InvalidBuffer;
+	Page		leafPage = NULL;
+	int			leafSlot = 0;
+	BlockNumber leafFirst = InvalidBlockNumber;
+	int32		leafPages = 0;
+
+	/* ---- Aux data accumulated in memory ---- */
+	uint16		   *sufflens;
+	ItemPointerData *tids;
+	Size			bitmapBytes;
+	uint8		   *offsetZeroBm;
+
+	/* ---- Previous-key buffer for LCP computation ---- */
+	char	   *prevKeyBuf;
+	int			prevEffLen = 0;
+
+	/* ---- Loop state ---- */
+	Datum		d;
+	bool		isNull;
+	int64		i = 0;
+
+	if (bs->numEntries == 0)
+		return;
+
+	/* Allocate in-memory aux arrays */
+	sufflens = palloc(bs->numEntries * sizeof(uint16));
+	tids = palloc(bs->numEntries * sizeof(ItemPointerData));
+	bitmapBytes = (bs->numEntries + BITS_PER_BYTE - 1) / BITS_PER_BYTE;
+	offsetZeroBm = palloc0(bitmapBytes);
+	prevKeyBuf = palloc(bs->maxPrefixLen);
+
+	/* ---- Streaming pass: write leaf pages + fill aux arrays ---- */
+	while (tuplesort_getdatum(bs->sortstate, true, false, &d, &isNull, NULL))
+	{
+		char		   *key;
+		uint16			suffixlen;
+		int32			offset;
+		ItemPointerData heaptid;
+		int				effLen;
+		int				lcp;
+		SAEntry		   *entry;
+
+		Assert(!isNull);
+		sa_decode_datum(d, bs->maxPrefixLen,
+						&key, &suffixlen, &offset, &heaptid);
+
+		effLen = Min((int) suffixlen, bs->maxPrefixLen);
+
+		/* ---- Leaf page ---- */
+		if (leafBuf == InvalidBuffer || leafSlot >= bs->entriesPerPage)
+		{
+			prevLeafBuf = leafBuf;
+
+			leafBuf = ReadBuffer(index, P_NEW);
+			LockBuffer(leafBuf, BUFFER_LOCK_EXCLUSIVE);
+			leafPage = BufferGetPage(leafBuf);
+			SAInitPage(leafPage, SA_PAGE_LEAF, BufferGetPageSize(leafBuf));
+
+			if (leafFirst == InvalidBlockNumber)
+				leafFirst = BufferGetBlockNumber(leafBuf);
+
+			/* Set sa_next forward link on the completed previous page */
+			if (prevLeafBuf != InvalidBuffer)
+			{
+				SAPageGetOpaque(BufferGetPage(prevLeafBuf))->sa_next =
+					BufferGetBlockNumber(leafBuf);
+				MarkBufferDirty(prevLeafBuf);
+				UnlockReleaseBuffer(prevLeafBuf);
+				prevLeafBuf = InvalidBuffer;
+			}
+
+			leafSlot = 0;
+			leafPages++;
+		}
+
+		/* Compute LCP with previous sorted entry */
+		lcp = (i > 0) ?
+			sa_compute_lcp(prevKeyBuf, prevEffLen,
+						   key, effLen,
+						   bs->maxPrefixLen) : 0;
+
+		/* Fill SAEntry on current leaf page */
+		entry = SAPageGetEntry(leafPage, leafSlot, bs->entrySize);
+		entry->sa_lcp = lcp;
+		entry->sa_offset = offset;
+		ItemPointerCopy(&heaptid, &entry->sa_heaptid);
+		entry->sa_suffixlen = suffixlen;
+		MemSet(entry->sa_key, 0, bs->maxPrefixLen);
+		memcpy(entry->sa_key, key, effLen);
+		leafSlot++;
+
+		/* ---- Aux arrays ---- */
+		sufflens[i] = suffixlen;
+		ItemPointerCopy(&heaptid, &tids[i]);
+
+		if (offset == 0)
+		{
+			int bytePos = i / BITS_PER_BYTE;
+			int bitPos  = i % BITS_PER_BYTE;
+
+			offsetZeroBm[bytePos] |= (1 << bitPos);
+		}
+
+		/*
+		 * Save truncated key bytes for next LCP computation before
+		 * calling tuplesort_getdatum again (copy=false means the current
+		 * datum pointer may become invalid on the next call).
+		 */
+		memcpy(prevKeyBuf, key, effLen);
+		prevEffLen = effLen;
+
+		i++;
+	}
+
+	/* Flush the last leaf page */
+	if (leafBuf != InvalidBuffer)
+	{
+		MarkBufferDirty(leafBuf);
+		UnlockReleaseBuffer(leafBuf);
+	}
+
+	meta->sa_leaf_start = leafFirst;
+	meta->sa_leaf_pages = leafPages;
+
+	/* ---- Write sufflen section from memory (contiguous pages) ---- */
+	sa_write_array_section(index,
+						   sufflens, bs->numEntries,
+						   sizeof(uint16), SA_SUFFLENS_PER_PAGE,
+						   SA_PAGE_SUFFLEN,
+						   &meta->sa_sufflen_start, &meta->sa_sufflen_pages);
+
+	/* ---- Write TID section from memory (contiguous pages) ---- */
+	sa_write_array_section(index,
+						   tids, bs->numEntries,
+						   sizeof(ItemPointerData), SA_TIDS_PER_PAGE,
+						   SA_PAGE_TID,
+						   &meta->sa_tid_start, &meta->sa_tid_pages);
+
+	/* ---- Write bitmap section from memory ---- */
+	sa_flush_bitmaps(index, bs->numEntries,
+					 offsetZeroBm,
+					 &meta->sa_bitmap_start, &meta->sa_bitmap_pages,
+					 &meta->sa_bitmap_flags);
+
+	pfree(sufflens);
+	pfree(tids);
+	pfree(offsetZeroBm);
+	pfree(prevKeyBuf);
 }
 
 
@@ -536,8 +527,9 @@ sa_rewrite_meta(Relation index, SAMetaPageData *meta)
  *		Main entry point for CREATE INDEX ... USING saindex.
  *
  * Builds a complete suffix array index by scanning the heap, sorting
- * all suffix entries in memory, and writing the sorted data to
- * contiguous index pages organized into five sections.
+ * all suffix entries via tuplesort (spills to disk if needed), and
+ * writing the sorted data to contiguous index pages organized into
+ * five sections.
  */
 IndexBuildResult *
 sabuild(Relation heap, Relation index, struct IndexInfo *indexInfo)
@@ -546,8 +538,7 @@ sabuild(Relation heap, Relation index, struct IndexInfo *indexInfo)
 	SABuildState		bs;
 	SAMetaPageData		meta;
 	double				reltuples;
-	BlockNumber			blkno;
-	int32				npages;
+	TypeCacheEntry	   *typentry;
 
 	/* Sanity check: index relation should be empty at this point */
 	if (RelationGetNumberOfBlocks(index) != 0)
@@ -559,21 +550,31 @@ sabuild(Relation heap, Relation index, struct IndexInfo *indexInfo)
 	bs.maxPrefixLen = SAGetMaxPrefixLen(index);
 	bs.entrySize = SA_ENTRY_SIZE(bs.maxPrefixLen);
 	bs.entriesPerPage = SAEntriesPerPage(bs.entrySize);
-
-	bs.items = palloc(SA_INITIAL_ITEMS * sizeof(SASortItem));
+	bs.datumSize = VARHDRSZ + bs.maxPrefixLen + SA_SORT_DATUM_PAYLOAD_SIZE;
 	bs.numEntries = 0;
-	bs.maxEntries = SA_INITIAL_ITEMS;
 	bs.numHeapTuples = 0;
 
-	bs.textCtx = AllocSetContextCreate(CurrentMemoryContext,
-									   "SA build text storage",
-									   ALLOCSET_DEFAULT_SIZES);
+	/*
+	 * Initialize tuplesort on bytea datums.  byteacmp (via the bytea lt
+	 * operator) gives the same sort order as sa_compare_suffixes because:
+	 *   (a) the zero-padded key region sorts shorter suffixes first on tie,
+	 *   (b) the big-endian suffixlen tiebreaker ensures shorter-first for
+	 *       values that share a common prefix exceeding maxPrefixLen.
+	 */
+	typentry = lookup_type_cache(BYTEAOID, TYPECACHE_LT_OPR);
+	bs.sortstate = tuplesort_begin_datum(BYTEAOID,
+										 typentry->lt_opr,
+										 InvalidOid,	/* no collation */
+										 false,			/* nulls not first */
+										 maintenance_work_mem,
+										 NULL,			/* no parallel sort */
+										 TUPLESORT_NONE);
 
 	/* -------- Phase 0: write placeholder meta page at block 0 -------- */
 
 	sa_write_meta_placeholder(index, bs.maxPrefixLen);
 
-	/* -------- Phase 1: scan heap, generate suffix entries -------- */
+	/* -------- Phase 1: scan heap, feed suffix datums to sortstate -------- */
 
 	reltuples = table_index_build_scan(heap, index, indexInfo,
 									   true,	/* allow_sync */
@@ -585,42 +586,19 @@ sabuild(Relation heap, Relation index, struct IndexInfo *indexInfo)
 		 RelationGetRelationName(index),
 		 (long long) bs.numEntries, reltuples);
 
-	/* -------- Phase 2: sort all entries by full suffix text -------- */
+	/* -------- Phase 2: sort all entries -------- */
 
-	if (bs.numEntries > 1)
-		qsort(bs.items, bs.numEntries, sizeof(SASortItem), sa_sort_cmp);
+	tuplesort_performsort(bs.sortstate);
 
-	/* -------- Phase 3 & 4: write data sections -------- */
+	/* -------- Phase 3: write data sections from sorted stream -------- */
 
 	SAInitEmptyMeta(&meta, bs.maxPrefixLen);
 	meta.sa_num_entries = bs.numEntries;
 	meta.sa_num_heap_tuples = bs.numHeapTuples;
 
-	if (bs.numEntries > 0)
-	{
-		/* SA leaf pages (sorted entries with inline LCP) */
-		sa_write_leaves(index, &bs, &blkno, &npages);
-		meta.sa_leaf_start = blkno;
-		meta.sa_leaf_pages = npages;
+	sa_write_all_sections(index, &bs, &meta);
 
-		/* Suffix-length array */
-		sa_write_sufflens(index, &bs, &blkno, &npages);
-		meta.sa_sufflen_start = blkno;
-		meta.sa_sufflen_pages = npages;
-
-		/* TID array */
-		sa_write_tids(index, &bs, &blkno, &npages);
-		meta.sa_tid_start = blkno;
-		meta.sa_tid_pages = npages;
-
-		/* Bitmaps (offset-zero + exact-suffix) */
-		sa_write_bitmaps(index, &bs, &blkno, &npages,
-						 &meta.sa_bitmap_flags);
-		meta.sa_bitmap_start = blkno;
-		meta.sa_bitmap_pages = npages;
-	}
-
-	/* -------- Phase 5: finalize meta page with real section data -------- */
+	/* -------- Phase 4: finalize meta page with real section data -------- */
 
 	sa_rewrite_meta(index, &meta);
 
@@ -638,8 +616,7 @@ sabuild(Relation heap, Relation index, struct IndexInfo *indexInfo)
 
 	/* -------- Cleanup -------- */
 
-	MemoryContextDelete(bs.textCtx);
-	pfree(bs.items);
+	tuplesort_end(bs.sortstate);
 
 	/* -------- Return build statistics -------- */
 

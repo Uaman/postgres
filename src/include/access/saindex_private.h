@@ -40,6 +40,7 @@
 #include "fmgr.h"
 #include "nodes/tidbitmap.h"
 #include "storage/bufmgr.h"
+#include "utils/tuplesort.h"
 
 
 /* ----------------------------------------------------------------
@@ -267,23 +268,16 @@ typedef struct SAMetaPageData
 		 * the range of suffixes starting with the pattern, this bitmap filters
 		 * to entries where the suffix IS the full value (starts at offset 0). */
 
-#define SA_BITMAP_EXACT_SUFFIX		(1 << 1)
-		/* Bit i = 1 iff SA[i].sa_suffixlen <= sa_max_prefix_len.
-		 * The stored prefix captures the full suffix — comparison is exact,
-		 * no heap recheck is needed for key verification. */
-
 /*
  * Number of bitmaps present, computed from flags.
  */
 #define SABitmapCount(flags) \
-	(((flags) & SA_BITMAP_OFFSET_ZERO  ? 1 : 0) + \
-	 ((flags) & SA_BITMAP_EXACT_SUFFIX ? 1 : 0))
+	(((flags) & SA_BITMAP_OFFSET_ZERO ? 1 : 0))
 
 /*
  * Ordinal position of a specific bitmap within the bitmap section.
  * Bitmaps are stored in flag bit order:
  *   position 0: offset-zero  (if present)
- *   position 1: exact-suffix (if present, and offset-zero is also present)
  *   etc.
  */
 #define SABitmapOrdinal(flags, which) \
@@ -535,30 +529,33 @@ typedef SAScanOpaqueData *SAScanOpaque;
  */
 
 /*
- * SASortItem -- in-memory representation of one suffix during build.
- *
- * The 'suffix' pointer points into a long-lived copy of the original
- * heap text value (kept in SABuildState.textCtx).  All suffixes of
- * one value share the same underlying allocation.
+ * Payload size appended after the sort key bytes in each sort datum.
+ * Layout (all fields packed, big-endian where multi-byte):
+ *   uint16  suffixlen    — true suffix length before truncation
+ *   int32   offset       — byte offset of suffix start in original value
+ *   6 bytes heaptid      — ItemPointerData
  */
-typedef struct SASortItem
-{
-	const char	   *suffix;			/* pointer to suffix start within value copy */
-	int				suffixlen;		/* length of suffix (value_len - offset) */
-	ItemPointerData	heaptid;		/* heap row identifier */
-	int32			offset;			/* byte offset of suffix start in value */
-} SASortItem;
+#define SA_SORT_DATUM_PAYLOAD_SIZE	(sizeof(uint16) + sizeof(int32) + \
+									 sizeof(ItemPointerData))
 
 /*
  * SABuildState -- mutable state for sabuild().
  *
- * The build callback accumulates SASortItems in a dynamically-grown
- * array, then sabuild() qsorts them and writes the sorted result
- * to index pages.
+ * Each suffix is encoded as a bytea datum and fed to a tuplesort state.
+ * The sort datum layout is:
  *
- * TODO: for very large tables, switch to tuplesort-based external sort
- * to avoid exhausting memory.  For now, all suffix entries and their
- * text data must fit in RAM.
+ *   [0 .. maxPrefixLen-1]                 suffix bytes, zero-padded  (sort key)
+ *   [maxPrefixLen .. +1]                  suffixlen  big-endian uint16
+ *   [maxPrefixLen+2 .. +5]                offset     big-endian int32
+ *   [maxPrefixLen+6 .. +11]               heaptid    (6 bytes)
+ *
+ * The sort key (zero-padded prefix) sorts identically to sa_compare_suffixes:
+ *   - byte-wise ordering of the suffix content
+ *   - when the zero-padded keys tie, the big-endian suffixlen acts as
+ *     tiebreaker: shorter suffix sorts first (smaller uint16 value)
+ *
+ * tuplesort handles spilling to disk when the sort exceeds
+ * maintenance_work_mem, eliminating the RAM-must-fit-all constraint.
  */
 typedef struct SABuildState
 {
@@ -566,17 +563,14 @@ typedef struct SABuildState
 	int32		maxPrefixLen;		/* from reloptions */
 	int32		entrySize;			/* SA_ENTRY_SIZE(maxPrefixLen) */
 	int32		entriesPerPage;		/* entries per SA leaf page */
+	int32		datumSize;			/* VARHDRSZ + maxPrefixLen + SA_SORT_DATUM_PAYLOAD_SIZE */
 
-	/* Dynamic array of sort entries */
-	SASortItem *items;
-	int64		numEntries;			/* entries accumulated so far */
-	int64		maxEntries;			/* allocated capacity of items[] */
+	/* External sort */
+	Tuplesortstate *sortstate;
 
 	/* Counters */
+	int64		numEntries;			/* suffixes fed to sortstate so far */
 	int64		numHeapTuples;		/* heap rows processed */
-
-	/* Memory management */
-	MemoryContext textCtx;			/* stores copies of heap text values */
 } SABuildState;
 
 
